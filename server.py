@@ -7,24 +7,28 @@ controls and draw what the server tells them.
 
 THE GAME
   * Everyone spawns into a long 3D arena. Walk up to another player and press
-    Q to tether to them (press Q next to them again to untether).
-  * Race to the finish line - BOTH tethered partners have to get there. If
-    either one touches a spike (or falls in the void) the whole pair goes back
-    to the start. When a pair finishes, only THAT pair resets.
+    Q to tether to them (press Q next to them again to untether). You can be
+    tethered to several people at once.
+  * Everyone joined together by ropes is a group. The WHOLE group has to reach
+    the finish line. If anyone touches a spike (or falls in the void) the whole
+    group goes back to the start. When a group finishes, only THAT group resets.
+  * The more players in a group, the shorter the ropes: with n players each rope
+    is 1/(n-1) of the normal length (never shorter than MIN_REST).
   * The tether wraps around poles and walls like a real rope - as many times
     as you like.
-  * Two scoreboards: fastest finish times, and most finishes per player.
+  * Two scoreboards: fastest finish times, and most players finished at once
+    (each one uses the other as its tiebreaker).
 
 Movement is icy and bouncy: low friction, long slides, walls bounce you back.
   DOCK  - hold next to a wall/floor to lock in place as an anchor.
-  GRAB  - hold near your partner to pick them up. Let go to throw them.
+  GRAB  - hold near a tethered friend to pick them up. Let go to throw them.
           A rider can press jump to leap off for a double-height hop.
   SLINGSHOT - dock, let your partner run away to stretch the tether (they
           get extra pulling strength while leaning into a taut rope), then
           they let go and fly back at you. Grab them as they pass and jump.
 
-The host (whoever opens the page on the machine running this server) gets a
-panel with Kick buttons.
+The host (whoever opens the page on the machine running this server, or opens
+/?host=<HOST_KEY> when it is hosted online) gets a panel with Kick buttons.
 
 Coordinates: x = along the race (finish is +x), y = up, z = sideways.
 Run with:  python3 server.py
@@ -40,6 +44,7 @@ import socket
 import struct
 import time
 import traceback
+from urllib.parse import unquote_plus
 
 PORT = int(os.environ.get("PORT", 3000))
 SIZE = 40                  # player cube size
@@ -68,7 +73,8 @@ MAX_SPEED = 2600           # cap so slingshots stay sane (was 1500)
 VOID_Y = -700              # fall below this and your pair is sent back
 
 # --- the energy tether ---
-TETHER_REST = 280          # px of rope before it gets taut
+TETHER_REST = 280          # px of rope before it gets taut (2 players; more players = shorter)
+MIN_REST = 60              # ropes never get shorter than this, however big the group
 TETHER_K = 6.0             # pull strength: acceleration per px of stretch
 TETHER_DAMP = 0.5          # drag on the beam while it is being stretched further
 TETHER_MAX_ACC = 4500
@@ -203,17 +209,19 @@ def lane_z(lane):
 # ---------- game state ----------
 players = {}   # id -> player dict
 clients = {}   # id -> StreamWriter
-teams = {}     # id -> team dict
+links = {}     # id -> a rope between two players
+groups = []    # lists of player ids joined together by ropes (rebuilt every tick)
+finish_events = []      # groups that just finished and are waiting to go back to the start
 next_id = 1
-next_team = 1
+next_link = 1
 event_seq = 0
 event_text = ""
 event_kind = "bad"
 kick_block = {}         # ip -> monotonic time the block ends
-best_runs = []          # [{"names": str, "time": seconds}] fastest first
-finish_counts = {}      # lowercase name -> {"name": str, "count": int}
+best_runs = []          # fastest finishes: [{"names", "time", "count"}]
+best_groups = []        # most players finished at once: same fields
 LOCAL_IPS = {"127.0.0.1", "::1"}
-HOST_KEY = os.environ.get("HOST_KEY", "")   # when hosted online: open /?host=<key> to be the host
+HOST_KEY = os.environ.get("HOST_KEY", "").strip()   # when hosted online: open /?host=<key> to be the host
 
 
 def clean_name(raw, fallback):
@@ -236,6 +244,7 @@ def new_player(pid, ip="?", host=False):
         "link_prev": False, "link_edge": False, "link_cd": 0.0,
         "rising_jump": False, "grab_cd": 0.0,
         "carried_by": None, "carrying": None, "team": None,
+        "fin": False, "fin_time": 0.0,
         "run_start": time.monotonic(), "last_chat": 0.0,
         "color": COLORS[(pid - 1) % len(COLORS)],
         "input": {"mx": 0.0, "mz": 0.0, "jump": False, "dock": False,
@@ -247,11 +256,81 @@ def center(p):
     return (p["x"] + SIZE / 2, p["y"] + SIZE / 2, p["z"] + SIZE / 2)
 
 
-def partner_of(p):
-    t = teams.get(p["team"])
-    if not t:
-        return None
-    return players.get(t["b"] if t["a"] == p["id"] else t["a"])
+def linked_players(p):
+    """Everyone p has a rope to."""
+    out = []
+    for l in links.values():
+        if l["a"] == p["id"]:
+            o = players.get(l["b"])
+        elif l["b"] == p["id"]:
+            o = players.get(l["a"])
+        else:
+            continue
+        if o is not None:
+            out.append(o)
+    return out
+
+
+def find_link(aid, bid):
+    for l in links.values():
+        if (l["a"] == aid and l["b"] == bid) or (l["a"] == bid and l["b"] == aid):
+            return l
+    return None
+
+
+def group_of(p):
+    """The players p is roped together with (including p). Just [p] if alone."""
+    for g in groups:
+        if p["id"] in g:
+            return [players[i] for i in g if i in players]
+    return [p]
+
+
+def names_of(ids):
+    ns = [players[i]["name"] for i in ids if i in players]
+    if not ns:
+        return "?"
+    if len(ns) == 1:
+        return ns[0]
+    if len(ns) == 2:
+        return f"{ns[0]} & {ns[1]}"
+    if len(ns) == 3:
+        return f"{ns[0]}, {ns[1]} & {ns[2]}"
+    return f"{ns[0]}, {ns[1]}, {ns[2]} +{len(ns) - 3}"
+
+
+def compute_groups():
+    """Everyone joined by ropes forms a group (p["team"] = lowest id in it).
+    Every rope in a group of n players has rest length TETHER_REST / (n - 1)."""
+    global groups
+    parent = {pid: pid for pid in players}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for l in links.values():
+        if l["a"] in parent and l["b"] in parent:
+            ra, rb = find(l["a"]), find(l["b"])
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+    comp = {}
+    for pid in players:
+        comp.setdefault(find(pid), []).append(pid)
+    groups = [sorted(m) for m in comp.values() if len(m) > 1]
+    groups.sort()
+    for p in players.values():
+        p["team"] = None
+    size = {}
+    for g in groups:
+        for pid in g:
+            players[pid]["team"] = g[0]
+            size[pid] = len(g)
+    for l in links.values():
+        n = size.get(l["a"], 2)
+        l["rest"] = max(MIN_REST, TETHER_REST / max(1, n - 1))
 
 
 def place(p, x, z):
@@ -264,28 +343,28 @@ def place(p, x, z):
     p["carried_by"] = p["carrying"] = None
     p["coyote"] = p["jump_buf"] = 0.0
     p["rising_jump"] = False
+    p["fin"] = False
     p["run_start"] = time.monotonic()
 
 
-def reset_team(t):
-    """Send both partners back to the start line."""
-    a, b = players.get(t["a"]), players.get(t["b"])
-    z = lane_z(t["lane"])
-    if a:
-        place(a, START_X, z - 28)
-    if b:
-        place(b, START_X, z + 28)
-    t["pivots"] = []
-    t["finishing"] = None
+def reset_ids(ids):
+    """Send these players back to the start line, side by side, and unwind their ropes."""
+    ps = [players[i] for i in sorted(ids) if i in players]
+    n = len(ps)
+    if not n:
+        return
+    z0 = lane_z(ps[0]["id"])
+    for i, p in enumerate(ps):
+        z = z0 + (i - (n - 1) / 2) * 56
+        place(p, START_X, max(-HALF_W + 20, min(HALF_W - 20 - SIZE, z)))
+    idset = {p["id"] for p in ps}
+    for l in links.values():
+        if l["a"] in idset or l["b"] in idset:
+            l["pivots"] = []
 
 
 def reset_solo(p):
     place(p, START_X, lane_z(p["id"]))
-
-
-def team_names(t):
-    a, b = players.get(t["a"]), players.get(t["b"])
-    return f"{a['name'] if a else '?'} & {b['name'] if b else '?'}"
 
 
 # ---------- messaging helpers ----------
@@ -325,59 +404,68 @@ def announce(text, kind="bad"):
 
 
 # ---------- scoreboards ----------
+def sort_scores():
+    # fastest: quickest time wins, more players wins a tie
+    best_runs.sort(key=lambda e: (e["time"], -e["count"]))
+    # most players at once: biggest group wins, quicker time wins a tie
+    best_groups.sort(key=lambda e: (-e["count"], e["time"]))
+    del best_runs[10:]
+    del best_groups[10:]
+
+
 def load_scores():
     try:
         with open(SCORES_FILE) as f:
             data = json.load(f)
-        best_runs[:] = [e for e in data.get("fastest", []) if "names" in e and "time" in e][:10]
-        finish_counts.update({k: v for k, v in data.get("counts", {}).items()
-                              if isinstance(v, dict) and "name" in v and "count" in v})
+        for key, dest, fallback in (("fastest", best_runs, []), ("most", best_groups, data.get("fastest", []))):
+            for e in data.get(key, fallback):
+                if isinstance(e, dict) and "names" in e and "time" in e:
+                    dest.append({"names": str(e["names"])[:60], "time": float(e["time"]),
+                                 "count": int(e.get("count", 2))})
+        sort_scores()
         print(f"Loaded scores from {SCORES_FILE}")
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         pass
 
 
 def save_scores():
     try:
         with open(SCORES_FILE, "w") as f:
-            json.dump({"fastest": best_runs, "counts": finish_counts}, f)
+            json.dump({"fastest": best_runs, "most": best_groups}, f)
     except OSError:
         pass
 
 
 def scores_msg():
-    most = sorted(finish_counts.values(), key=lambda e: (-e["count"], e["name"].lower()))[:5]
-    return {"type": "scores", "fastest": best_runs[:5], "most": most}
+    return {"type": "scores", "fastest": best_runs[:5], "most": best_groups[:5]}
 
 
-def record_finish(t, secs):
-    names = team_names(t)
-    best_runs.append({"names": names, "time": round(secs, 2)})
-    best_runs.sort(key=lambda e: e["time"])
-    del best_runs[10:]
-    for pid in (t["a"], t["b"]):
-        p = players.get(pid)
-        if p is None:
-            continue
-        e = finish_counts.setdefault(p["name"].strip().lower(), {"name": p["name"], "count": 0})
-        e["name"] = p["name"]
-        e["count"] += 1
+def record_finish(ids, secs):
+    entry = {"names": names_of(ids), "time": round(secs, 2), "count": len(ids)}
+    best_runs.append(dict(entry))
+    best_groups.append(dict(entry))
+    sort_scores()
     save_scores()
     broadcast(scores_msg())
 
 
 # ---------- tethering (Q) ----------
 def link(a, b):
-    global next_team
-    tid = next_team
-    next_team += 1
-    t = {"id": tid, "a": a["id"], "b": b["id"], "lane": a["id"], "pivots": [],
-         "rope": [], "len": 0.0, "finishing": None, "fin_time": 0.0}
-    teams[tid] = t
-    a["team"] = b["team"] = tid
-    # tethering up at the start counts as the start of a timed run for both
-    if a["x"] + SIZE / 2 < START_LINE_X and b["x"] + SIZE / 2 < START_LINE_X:
-        a["run_start"] = b["run_start"] = time.monotonic()
+    """Rope two players together. Returns the new rope (None if they already have one)."""
+    global next_link
+    if find_link(a["id"], b["id"]) is not None:
+        return None
+    lid = next_link
+    next_link += 1
+    t = {"id": lid, "a": a["id"], "b": b["id"], "pivots": [], "rope": [], "len": 0.0, "rest": TETHER_REST}
+    links[lid] = t
+    compute_groups()
+    # roping up while everyone is still behind the start line restarts the run timers
+    members = group_of(a)
+    if all(p["x"] + SIZE / 2 < START_LINE_X for p in members):
+        now = time.monotonic()
+        for p in members:
+            p["run_start"] = now
     return t
 
 
@@ -386,15 +474,16 @@ def unlink(t):
     for p, q in ((a, b), (b, a)):
         if p is not None and q is not None and p["carrying"] == q["id"]:
             detach(p, "drop")
+    links.pop(t["id"], None)
     for p in (a, b):
-        if p is not None and p["team"] == t["id"]:
-            p["team"] = None
+        if p is not None:
             p["spin"] = 0.0
             p["lean"] = None
-    teams.pop(t["id"], None)
+    compute_groups()
 
 
 def handle_links():
+    """Q toggles a rope to the NEAREST player."""
     for p in list(players.values()):
         if not p["link_edge"] or p["link_cd"] > 0:
             continue
@@ -403,29 +492,17 @@ def handle_links():
         near = sorted(((math.dist(pc, center(q)), q) for q in players.values()
                        if q is not p and math.dist(pc, center(q)) <= LINK_RANGE),
                       key=lambda e: e[0])
-        t = teams.get(p["team"])
-        partner = partner_of(p)
-        if t is not None and partner is not None:
-            if any(q is partner for _, q in near):
-                unlink(t)
-                sys_chat(f"{p['name']} untethered from {partner['name']}")
-            elif not near:
-                unlink(t)
-                notice(p["id"], "Tether cut")
-                notice(partner["id"], f"{p['name']} cut the tether")
-            else:
-                notice(p["id"], f"You're tethered to {partner['name']} - press Q next to them to untether")
-            continue
         if not near:
             notice(p["id"], "Nobody close enough - get next to a player and press Q")
             continue
-        free = [q for _, q in near if q["team"] is None]
-        if not free:
-            notice(p["id"], f"{near[0][1]['name']} is already tethered")
-            continue
-        q = free[0]
-        link(p, q)
-        sys_chat(f"{p['name']} tethered to {q['name']}")
+        q = near[0][1]
+        t = find_link(p["id"], q["id"])
+        if t is not None:
+            unlink(t)
+            sys_chat(f"{p['name']} untethered from {q['name']}")
+        else:
+            link(p, q)
+            sys_chat(f"{p['name']} tethered to {q['name']}")
 
 
 # ---------- kicking (host only) ----------
@@ -486,15 +563,18 @@ def handle_carry():
             c = players.get(r["carried_by"])
             if c is not None:
                 detach(c, "jump")
-    # holding grab near your partner picks them up (so you can catch them mid-flight)
+    # holding grab near a tethered friend picks them up (so you can catch them mid-flight)
     for c in list(players.values()):
         if not c["input"]["grab"] or c["carrying"] is not None or c["carried_by"] is not None:
             continue
-        q = partner_of(c)
-        if (q is None or q["carried_by"] is not None or q["carrying"] is not None
-                or q["grab_cd"] > 0):
-            continue
-        if math.dist((q["x"], q["y"], q["z"]), (c["x"], c["y"], c["z"])) <= GRAB_RANGE:
+        q, qd = None, GRAB_RANGE
+        for o in linked_players(c):
+            if o["carried_by"] is not None or o["carrying"] is not None or o["grab_cd"] > 0:
+                continue
+            d = math.dist((o["x"], o["y"], o["z"]), (c["x"], c["y"], c["z"]))
+            if d <= qd:
+                q, qd = o, d
+        if q is not None:
             q["carried_by"] = c["id"]
             q["docked"] = False
             c["carrying"] = q["id"]
@@ -677,13 +757,21 @@ def update_rope(t, a, b):
 def apply_tethers(dt):
     for p in players.values():
         p["lean"] = None
-    for t in teams.values():
+        p["spin"] = 0.0
+
+    def unit(frm, to):
+        dx, dy, dz = to[0] - frm[0], to[1] - frm[1], to[2] - frm[2]
+        d = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
+        return dx / d, dy / d, dz / d
+
+    lean_best = {}
+    for t in links.values():
         a, b = players.get(t["a"]), players.get(t["b"])
         if not a or not b:
             continue
+        rest = t["rest"]
         ca = (a["x"] + SIZE / 2, a["y"] + SIZE / 2, a["z"] + SIZE / 2)
         cb = (b["x"] + SIZE / 2, b["y"] + SIZE / 2, b["z"] + SIZE / 2)
-        a["spin"] = b["spin"] = 0.0
         if a["carried_by"] == b["id"] or b["carried_by"] == a["id"]:
             t["pivots"] = []
             t["rope"] = [list(ca), list(cb)]
@@ -703,24 +791,20 @@ def apply_tethers(dt):
                 if r2 > 400:
                     who["spin"] = max(-12.0, min(12.0, -(rx * who["vz"] - rz * who["vx"]) / r2))
 
-        if length <= TETHER_REST or (a["docked"] and b["docked"]):
+        if length <= rest or (a["docked"] and b["docked"]):
             continue
-
-        def unit(frm, to):
-            dx, dy, dz = to[0] - frm[0], to[1] - frm[1], to[2] - frm[2]
-            d = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
-            return dx / d, dy / d, dz / d
 
         ua = unit(ca, (pts[1][0], ys[1], pts[1][1]))
         ub = unit(cb, (pts[-2][0], ys[-2], pts[-2][1]))
+        stretch = length - rest
         # a taut rope lets you lean into it: running away from it is much stronger
         for who, u in ((a, ua), (b, ub)):
             h = math.hypot(u[0], u[2])
-            if h > 0.05:
+            if h > 0.05 and stretch > lean_best.get(who["id"], -1.0):
+                lean_best[who["id"]] = stretch
                 who["lean"] = (u[0] / h, u[2] / h)
         rel = -(a["vx"] * ua[0] + a["vy"] * ua[1] + a["vz"] * ua[2]) \
               - (b["vx"] * ub[0] + b["vy"] * ub[1] + b["vz"] * ub[2])
-        stretch = length - TETHER_REST
         acc = min(TETHER_MAX_ACC, TETHER_K * stretch + TETHER_DAMP * max(rel, 0.0))
         share = 1.0 if (a["docked"] or b["docked"]) else 0.5
         if not a["docked"]:
@@ -872,9 +956,8 @@ def team_progress(p):
 
 
 def run_time(p, now):
-    t = teams.get(p["team"])
-    if t is not None and t.get("finishing") is not None:
-        return t["fin_time"]
+    if p["fin"]:
+        return p["fin_time"]
     return now - p["run_start"]
 
 
@@ -883,6 +966,7 @@ def tick(dt):
     for p in players.values():
         update_edges(p, dt)
     handle_links()
+    compute_groups()
     handle_carry()
     apply_tethers(dt)
     for p in players.values():
@@ -890,35 +974,39 @@ def tick(dt):
             step_player(p, dt)
     sync_riders()
 
-    # hazards: either partner touching one sends the pair back to the start
+    # hazards: anyone touching one sends their whole roped group back to the start
     for p in list(players.values()):
+        if p["fin"]:
+            continue
         why = hit_hazard(p)
         if why:
-            t = teams.get(p["team"])
-            if t:
-                announce(f"{p['name']} {why}! {team_names(t)} back to the start")
-                reset_team(t)
+            g = [q["id"] for q in group_of(p)]
+            if len(g) > 1:
+                announce(f"{p['name']} {why}! {names_of(g)} back to the start")
+                reset_ids(g)
             else:
                 announce(f"{p['name']} {why}! Back to the start")
                 reset_solo(p)
 
-    # finish: both tethered partners over the line -> only that pair resets
+    # finish: the WHOLE group over the line -> only that group resets
     now = time.monotonic()
-    for t in list(teams.values()):
-        a, b = players.get(t["a"]), players.get(t["b"])
-        if not a or not b:
+    for g in groups:
+        ps = [players[i] for i in g if i in players]
+        if len(ps) < 2 or any(p["fin"] for p in ps):
             continue
-        if t["finishing"] is not None:
-            if now >= t["finishing"]:
-                reset_team(t)
-            continue
-        if min(a["x"], b["x"]) + SIZE / 2 >= FINISH_X:
-            secs = now - min(a["run_start"], b["run_start"])
-            t["finishing"] = now + FINISH_PAUSE
-            t["fin_time"] = secs
-            record_finish(t, secs)
-            announce(f"{team_names(t)} finished in {secs:.1f}s!", "good")
-            sys_chat(f"{team_names(t)} finished in {secs:.1f}s!")
+        if all(p["x"] + SIZE / 2 >= FINISH_X for p in ps):
+            secs = now - min(p["run_start"] for p in ps)
+            for p in ps:
+                p["fin"] = True
+                p["fin_time"] = secs
+            finish_events.append({"ids": list(g), "until": now + FINISH_PAUSE})
+            record_finish(g, secs)
+            announce(f"{names_of(g)} finished in {secs:.1f}s!", "good")
+            sys_chat(f"{names_of(g)} finished in {secs:.1f}s!")
+    for ev in list(finish_events):
+        if now >= ev["until"]:
+            finish_events.remove(ev)
+            reset_ids(ev["ids"])
 
 
 async def game_loop():
@@ -937,17 +1025,22 @@ async def game_loop():
                      "vx": round(p["vx"]), "vy": round(p["vy"]), "vz": round(p["vz"]),
                      "docked": p["docked"], "carried_by": p["carried_by"],
                      "carrying": p["carrying"], "team": p["team"],
+                     "linked": [o["id"] for o in linked_players(p)],
                      "spin": round(p["spin"], 2), "run": round(run_time(p, now), 1)}
                     for p in players.values()
                 ],
-                "teams": [
+                "ropes": [
                     {"id": t["id"], "a": t["a"], "b": t["b"],
-                     "names": team_names(t),
-                     "pa": round(team_progress(players[t["a"]]), 4) if t["a"] in players else 0,
-                     "pb": round(team_progress(players[t["b"]]), 4) if t["b"] in players else 0,
-                     "rope": t["rope"], "len": round(t["len"]),
-                     "fin": t["finishing"] is not None, "fin_time": round(t["fin_time"], 1)}
-                    for t in teams.values()
+                     "team": players[t["a"]]["team"] if t["a"] in players else None,
+                     "rope": t["rope"], "len": round(t["len"]), "rest": round(t["rest"])}
+                    for t in links.values()
+                ],
+                "groups": [
+                    {"id": g[0], "members": g, "names": names_of(g),
+                     "progs": [round(team_progress(players[i]), 4) for i in g],
+                     "fin": any(players[i]["fin"] for i in g),
+                     "fin_time": round(players[g[0]]["fin_time"], 1)}
+                    for g in groups
                 ],
             })
         except Exception:
@@ -1023,7 +1116,7 @@ async def handle(reader, writer):
     host_key = ""
     for kv in query.split("&"):
         if kv.startswith("host="):
-            host_key = kv[5:]
+            host_key = unquote_plus(kv[5:]).strip()
     headers = {}
     for line in lines[1:]:
         if ":" in line:
@@ -1062,8 +1155,15 @@ async def handle(reader, writer):
         ip = (headers.get("x-forwarded-for") or headers.get("cf-connecting-ip")
               or headers.get("x-real-ip") or peer_ip).split(",")[0].strip()
     is_host = (not proxied) and peer_ip in LOCAL_IPS
-    if HOST_KEY and host_key and hmac.compare_digest(host_key.encode(), HOST_KEY.encode()):
-        is_host = True
+    host_status = "local" if is_host else "none"
+    if not is_host and host_key:
+        if not HOST_KEY:
+            host_status = "server_no_key"
+        elif hmac.compare_digest(host_key.encode(), HOST_KEY.encode()):
+            is_host, host_status = True, "ok"
+        else:
+            host_status = "wrong"
+        print(f"Host key attempt from {ip}: {host_status}")
 
     # WebSocket handshake
     accept = base64.b64encode(
@@ -1098,7 +1198,7 @@ async def handle(reader, writer):
     print(f"Player {pid} joined from {ip}{' (host)' if is_host else ''} ({len(players)} online)")
 
     writer.write(make_frame(json.dumps({
-        "type": "welcome", "id": pid, "size": SIZE, "host": is_host,
+        "type": "welcome", "id": pid, "size": SIZE, "host": is_host, "host_status": host_status,
         "boxes": [list(b) for b in BOXES],
         "start_x": START_X, "finish_x": FINISH_X, "half_w": HALF_W,
         "tether_rest": TETHER_REST, "grab_range": GRAB_RANGE, "link_range": LINK_RANGE,
@@ -1163,11 +1263,11 @@ async def handle(reader, writer):
                 carrier = players.get(me["carried_by"])
                 if carrier is not None:
                     carrier["carrying"] = None
-            t = teams.get(me["team"])
-            if t:
+            for t in [t for t in links.values() if pid in (t["a"], t["b"])]:
                 unlink(t)
         players.pop(pid, None)
         clients.pop(pid, None)
+        compute_groups()
         print(f"{name} left ({len(players)} online)")
         writer.close()
 
