@@ -57,7 +57,7 @@
   <div id="side">
     <div class="panel" id="hostpanel"><h3>Host: kick players</h3><div id="hostlist"></div></div>
     <div class="panel"><h3>Fastest finish</h3><ol id="sb-fast"></ol></div>
-    <div class="panel"><h3>Most finishes</h3><ol id="sb-most"></ol></div>
+    <div class="panel"><h3>Most players finished</h3><ol id="sb-most"></ol></div>
     <div class="panel" id="chatpanel">
       <h3>Chat</h3>
       <div id="chatlog"></div>
@@ -72,10 +72,10 @@
   <b>Jump:</b> <kbd>Space</kbd> &nbsp;
   <b>Dock:</b> hold <kbd>Shift</kbd> &nbsp;
   <b>Tether / untether:</b> <kbd>Q</kbd> next to a player &nbsp;
-  <b>Grab partner:</b> hold <kbd>E</kbd> &nbsp;
+  <b>Grab a tethered friend:</b> hold <kbd>E</kbd> &nbsp;
   <b>Chat:</b> <kbd>Enter</kbd> &nbsp;
   <b>Camera:</b> drag the mouse or arrow keys.<br>
-  Tether up with a friend, then both of you must reach the finish. A spike or the void sends you both back to the start.
+  Tether up with as many friends as you like (<kbd>Q</kbd> toggles a rope to the nearest player). Everyone roped together must reach the finish, and the more of you there are, the shorter the ropes get. A spike or the void sends the whole group back to the start.
   Big gap? Dock, have your partner run away to stretch the rope, then let go - they fly back at you.
   Hold <kbd>E</kbd> to grab them as they pass, jump together, and the rider can hit <kbd>Space</kbd> mid-air for a second hop.
 </p>
@@ -106,9 +106,10 @@ let size = 40, rest = 280, grabRange = 90, linkRange = 130;
 let startX = 150, finishX = 4300, halfW = 500;
 let boxes = [];
 let players = [];
-let teams = [];
+let ropes = [];
+let groups = [];
 let lastEventSeq = null, bannerText = '', bannerUntil = 0, bannerKind = 'bad';
-let ws, kicked = false;
+let ws, kicked = false, hostNote = '';
 const bubbles = new Map();    // player id -> { text, until }
 
 const render = new Map();     // id -> smoothed drawing state
@@ -163,7 +164,7 @@ function fillList(id, rows) {
 }
 function showScores(s) {
   fillList('sb-fast', (s.fastest || []).map((e) => [e.names, e.time.toFixed(1) + 's']));
-  fillList('sb-most', (s.most || []).map((e) => [e.name, String(e.count)]));
+  fillList('sb-most', (s.most || []).map((e) => [e.names, `${e.count} \u00b7 ${e.time.toFixed(1)}s`]));
 }
 let hostSig = '';
 function updateHostPanel() {
@@ -204,7 +205,7 @@ function connect() {
   ws = new WebSocket(`${proto}://${location.host}/${location.search}`);
   ws.onopen = () => { statusEl.textContent = 'Connected'; sendName(); };
   ws.onclose = () => {
-    players = []; teams = []; render.clear(); camInit = false;
+    players = []; ropes = []; groups = []; render.clear(); camInit = false;
     if (kicked) return;
     statusEl.textContent = 'Disconnected, retrying...';
     setTimeout(connect, 1500);
@@ -218,13 +219,16 @@ function connect() {
       hostPanel.style.display = isHost ? 'block' : 'none';
       lastEventSeq = null;
       buildSpikes(); showScores(msg.scores || {});
+      hostNote = { wrong: "host key not accepted - it must match the server's HOST_KEY exactly",
+                   server_no_key: 'server has no HOST_KEY set - add an environment variable named exactly HOST_KEY, then redeploy' }[msg.host_status] || '';
+      if (hostNote) { bannerText = 'Host key not accepted - see the status line below the game'; bannerKind = 'bad'; bannerUntil = performance.now() + 15000; }
     } else if (msg.type === 'state') {
-      players = msg.players; teams = msg.teams;
+      players = msg.players; ropes = msg.ropes; groups = msg.groups;
       if (lastEventSeq !== null && msg.event.seq !== lastEventSeq) {
         bannerText = msg.event.text; bannerKind = msg.event.kind || 'bad'; bannerUntil = performance.now() + 2800;
       }
       lastEventSeq = msg.event.seq;
-      statusEl.textContent = `Connected - ${players.length} player(s)` + (isHost ? ' - you are the host' : '');
+      statusEl.textContent = `Connected - ${players.length} player(s)` + (isHost ? ' - you are the host' : '') + (hostNote ? ' - ' + hostNote : '');
       updateHostPanel();
     } else if (msg.type === 'chat') {
       addChat(msg);
@@ -617,7 +621,7 @@ function drawPlayers() {
 
 function drawTethers() {
   bindMesh(cubeMesh);
-  for (const t of teams) {
+  for (const t of ropes) {
     const pts = t.rope;
     if (!pts || pts.length < 2) continue;
     // draw the rope from where the blocks are being *drawn*, so riders look right
@@ -628,13 +632,13 @@ function drawTethers() {
       line[0] = [da[0] + size / 2, da[1] + size / 2, da[2] + size / 2];
       line[line.length - 1] = [db[0] + size / 2, db[1] + size / 2, db[2] + size / 2];
     }
-    const stretch = Math.max(0, Math.min(1, (t.len - rest) / (rest * 1.2)));
-    const base = hex(teamColor(t.id));
+    const stretch = Math.max(0, Math.min(1, (t.len - t.rest) / (t.rest * 1.2)));
+    const base = hex(teamColor(t.team != null ? t.team : t.id));
     const col = [base[0] + (1 - base[0]) * stretch, base[1] + (1 - base[1]) * stretch * 0.9, base[2] + (0.3 - base[2]) * stretch * 0.2];
     setColor(col, 1, false, false);
     const thick = 5 + stretch * 5;
-    if (line.length === 2 && t.len < rest) {          // slack rope sags
-      const p = line[0], q = line[1], sag = (1 - t.len / rest) * 90;
+    if (line.length === 2 && t.len < t.rest) {          // slack rope sags
+      const p = line[0], q = line[1], sag = (1 - t.len / t.rest) * 90;
       let prev = p;
       for (let i = 1; i <= 12; i++) {
         const u = i / 12, drop = 4 * u * (1 - u) * sag;
@@ -701,7 +705,7 @@ function drawHUD() {
     let label = p.id === myId ? `${p.name} (you)` : p.name;
     if (p.docked) label += '  [docked]';
     if (me && p.id !== myId && Math.hypot(p.x - me.x, p.y - me.y, p.z - me.z) <= linkRange) {
-      label += (me.team != null && me.team === p.team) ? '  [Q: untether]' : '  [Q: tether]';
+      label += (me.linked && me.linked.includes(p.id)) ? '  [Q: untether]' : '  [Q: tether]';
     }
     hud.font = '600 15px system-ui';
     hud.lineWidth = 4; hud.strokeStyle = 'rgba(0,0,0,0.6)'; hud.strokeText(label, sp[0], sp[1]);
@@ -741,7 +745,7 @@ function drawHUD() {
     hud.strokeText(msg, W / 2, H - 20); hud.fillText(msg, W / 2, H - 20);
   }
 
-  const myTeam = me ? teams.find((t) => t.id === me.team) : null;
+  const myTeam = me ? groups.find((g) => g.id === me.team) : null;
   if (myTeam && myTeam.fin) {
     hud.fillStyle = 'rgba(0,0,0,0.55)'; hud.fillRect(0, H / 2 - 70, W, 140);
     hud.fillStyle = '#ffd34d'; hud.font = 'bold 44px system-ui';
@@ -759,18 +763,19 @@ function drawHUD() {
 function drawProgress(me) {
   const bw = Math.min(720, W - 60), x0 = (W - bw) / 2;
   const trackLen = finishX - startX;
-  const rows = teams.map((t) => ({ id: t.id, own: !!me && t.id === me.team, col: teamColor(t.id), names: t.names,
-                                   pa: t.pa, pb: t.pb, a: t.a, b: t.b }));
+  const rows = groups.map((g) => ({ id: g.id, own: !!me && g.id === me.team, col: teamColor(g.id), names: g.names,
+                                    progs: g.progs, members: g.members }));
   if (me && me.team == null) {
     const pr = Math.max(0, Math.min(1, (me.x + size / 2 - startX) / trackLen));
-    rows.push({ id: 0, own: true, col: me.color, names: `${me.name} (no tether)`, pa: pr, pb: pr, a: me.id, b: me.id });
+    rows.push({ id: 0, own: true, col: me.color, names: `${me.name} (no tether)`, progs: [pr], members: [me.id] });
   }
-  rows.sort((a, b) => (a.own ? -1 : b.own ? 1 : Math.min(b.pa, b.pb) - Math.min(a.pa, a.pb)));
+  const worst = (r) => Math.min(...r.progs);
+  rows.sort((a, b) => (a.own ? -1 : b.own ? 1 : worst(b) - worst(a)));
   let y = 14;
   hud.textBaseline = 'alphabetic';
   for (const t of rows.slice(0, 5)) {
     const col = t.col;
-    const prog = Math.min(t.pa, t.pb);
+    const prog = Math.min(...t.progs);
     const left = Math.max(0, (1 - prog) * trackLen / 40);
     hud.fillStyle = 'rgba(0,0,0,0.45)'; roundRect(x0 - 10, y - 4, bw + 20, 44, 10); hud.fill();
     if (t.own) { hud.strokeStyle = col; hud.lineWidth = 2; roundRect(x0 - 10, y - 4, bw + 20, 44, 10); hud.stroke(); }
@@ -783,7 +788,8 @@ function drawProgress(me) {
     hud.fillStyle = 'rgba(255,255,255,0.14)'; roundRect(x0, by, bw, bh, 6); hud.fill();
     if (prog > 0.002) { hud.fillStyle = col; roundRect(x0, by, Math.max(10, bw * prog), bh, 6); hud.fill(); }
     // each partner's dot
-    for (const [pr, pid] of [[t.pa, t.a], [t.pb, t.b]]) {
+    for (let mi = 0; mi < t.members.length; mi++) {
+      const pr = t.progs[mi], pid = t.members[mi];
       const dx = x0 + bw * pr;
       hud.fillStyle = '#fff'; hud.beginPath(); hud.arc(dx, by + bh / 2, 6.5, 0, 7); hud.fill();
       const pl = players.find((p) => p.id === pid);
