@@ -109,7 +109,9 @@ let players = [];
 let ropes = [];
 let groups = [];
 let lastEventSeq = null, bannerText = '', bannerUntil = 0, bannerKind = 'bad';
-let ws, kicked = false, hostNote = '';
+let ws, kicked = false, hostNote = '', statusBase = '', perfText = '';
+let stateAt = 0, rtt = 0, serverMs = 0, fps = 0, fpsFrames = 0, fpsT = performance.now();
+let roster = new Map(), ropeTopo = [], groupTopo = [], teamOf = new Map(), linkedOf = new Map(), timers = new Map(), lastP = null;
 const bubbles = new Map();    // player id -> { text, until }
 
 const render = new Map();     // id -> smoothed drawing state
@@ -199,13 +201,54 @@ chatIn.addEventListener('keydown', (e) => {
   } else if (e.key === 'Escape') { chatIn.value = ''; chatIn.blur(); }
 });
 
+// ================= rebuilding the world from the compact messages =================
+function applyState() {
+  const now = performance.now();
+  players = lastP.map((a) => {
+    const info = roster.get(a[0]) || { name: 'P' + a[0], color: '#999999' };
+    const tm = timers.get(a[0]);
+    return { id: a[0], name: info.name, color: info.color, x: a[1], y: a[2], z: a[3],
+             vx: a[4] * 10, vy: a[5] * 10, vz: a[6] * 10, docked: !!(a[7] & 1), fin: !!(a[7] & 2),
+             carried_by: a[8] || null, carrying: null, spin: a[9] / 10,
+             team: teamOf.has(a[0]) ? teamOf.get(a[0]) : null, linked: linkedOf.get(a[0]) || [],
+             run: tm ? tm.run + (tm.fin ? 0 : (now - tm.at) / 1000) : 0 };
+  });
+  const byId = new Map(players.map((p) => [p.id, p]));
+  for (const p of players) if (p.carried_by != null && byId.has(p.carried_by)) byId.get(p.carried_by).carrying = p.id;
+
+  ropes = [];
+  const h2 = size / 2;
+  for (const r of ropeTopo) {
+    const a = byId.get(r.a), b = byId.get(r.b);
+    if (!a || !b) continue;
+    const pts = [[a.x + h2, a.y + h2, a.z + h2], ...r.piv.map((q) => [q[0], 0, q[1]]), [b.x + h2, b.y + h2, b.z + h2]];
+    const cum = [0];
+    for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][2] - pts[i - 1][2]));
+    const tot = cum[cum.length - 1] || 1;
+    for (let i = 1; i < pts.length - 1; i++) pts[i][1] = pts[0][1] + (pts[pts.length - 1][1] - pts[0][1]) * cum[i] / tot;
+    ropes.push({ id: r.id, a: r.a, b: r.b, team: teamOf.has(r.a) ? teamOf.get(r.a) : null, rest: r.rest,
+                 len: Math.hypot(cum[cum.length - 1], pts[pts.length - 1][1] - pts[0][1]), rope: pts });
+  }
+
+  const track = finishX - startX;
+  groups = groupTopo.map((g) => {
+    const ms = g.members.map((id) => byId.get(id)).filter(Boolean);
+    const tm = timers.get(g.members[0]);
+    return { id: g.members[0], members: ms.map((p) => p.id), names: g.names,
+             progs: ms.map((p) => Math.max(0, Math.min(1, (p.x + h2 - startX) / track))),
+             fin: ms.some((p) => p.fin), fin_time: tm ? tm.run : 0 };
+  });
+  statusBase = `Connected - ${players.length} player(s)` + (isHost ? ' - you are the host' : '') + (hostNote ? ' - ' + hostNote : '');
+  updateHostPanel();
+}
+
 // ================= connection =================
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/${location.search}`);
   ws.onopen = () => { statusEl.textContent = 'Connected'; sendName(); };
   ws.onclose = () => {
-    players = []; ropes = []; groups = []; render.clear(); camInit = false;
+    players = []; ropes = []; groups = []; render.clear(); camInit = false; statusBase = ''; lastP = null;
     if (kicked) return;
     statusEl.textContent = 'Disconnected, retrying...';
     setTimeout(connect, 1500);
@@ -222,14 +265,29 @@ function connect() {
       hostNote = { wrong: "host key not accepted - it must match the server's HOST_KEY exactly",
                    server_no_key: 'server has no HOST_KEY set - add an environment variable named exactly HOST_KEY, then redeploy' }[msg.host_status] || '';
       if (hostNote) { bannerText = 'Host key not accepted - see the status line below the game'; bannerKind = 'bad'; bannerUntil = performance.now() + 15000; }
-    } else if (msg.type === 'state') {
-      players = msg.players; ropes = msg.ropes; groups = msg.groups;
-      if (lastEventSeq !== null && msg.event.seq !== lastEventSeq) {
-        bannerText = msg.event.text; bannerKind = msg.event.kind || 'bad'; bannerUntil = performance.now() + 2800;
+    } else if (msg.type === 'topo') {            // rarely: who is here, rope shapes, who is roped to whom
+      roster = new Map(msg.players.map((q) => [q[0], { name: q[1], color: q[2] }]));
+      ropeTopo = msg.ropes.map((r) => ({ id: r[0], a: r[1], b: r[2], rest: r[3], piv: r[4] }));
+      groupTopo = msg.groups.map((g) => ({ members: g[0], names: g[1] }));
+      teamOf = new Map(); linkedOf = new Map();
+      for (const g of groupTopo) for (const id of g.members) teamOf.set(id, g.members[0]);
+      for (const r of ropeTopo) {
+        if (!linkedOf.has(r.a)) linkedOf.set(r.a, []);
+        if (!linkedOf.has(r.b)) linkedOf.set(r.b, []);
+        linkedOf.get(r.a).push(r.b); linkedOf.get(r.b).push(r.a);
       }
-      lastEventSeq = msg.event.seq;
-      statusEl.textContent = `Connected - ${players.length} player(s)` + (isHost ? ' - you are the host' : '') + (hostNote ? ' - ' + hostNote : '');
-      updateHostPanel();
+      if (lastP) applyState();
+    } else if (msg.type === 's') {               // ~20x a second: one short row per player
+      lastP = msg.p; stateAt = performance.now();
+      applyState();
+    } else if (msg.type === 't') {               // once a second: run timers
+      const at = performance.now();
+      timers = new Map(msg.a.map((a) => [a[0], { run: a[1], fin: a[2], at }]));
+    } else if (msg.type === 'event') {
+      bannerText = msg.text; bannerKind = msg.kind || 'bad'; bannerUntil = performance.now() + 2800;
+    } else if (msg.type === 'pong') {
+      rtt = performance.now() - msg.t; serverMs = msg.load;
+      perfText = `  |  ping ${Math.round(rtt)} ms  |  server ${serverMs} ms/tick  |  ${fps} fps`;
     } else if (msg.type === 'chat') {
       addChat(msg);
     } else if (msg.type === 'scores') {
@@ -257,18 +315,30 @@ function computeInput() {
   let mz = fz * fwd + fx * right;
   const m = Math.hypot(mx, mz);
   if (m > 1) { mx /= m; mz /= m; }
-  input.mx = +mx.toFixed(3); input.mz = +mz.toFixed(3);
+  input.mx = +mx.toFixed(2); input.mz = +mz.toFixed(2);
   input.jump = keys.has(' ');
   input.dock = keys.has('shift') || keys.has('f');
   input.grab = keys.has('e');
   input.link = keys.has('q');
 }
+let lastSentAt = 0, trailing = null;
 function sendInput(force) {
   computeInput();
   const s = JSON.stringify({ type: 'input', ...input });
-  if ((force || s !== lastSent) && ws && ws.readyState === 1) { ws.send(s); lastSent = s; }
+  if (!(force || s !== lastSent) || !ws || ws.readyState !== 1) return;
+  const now = performance.now();
+  if (!force && now - lastSentAt < 33) {            // cap at ~30 messages/s even while turning the camera
+    if (!trailing) trailing = setTimeout(() => { trailing = null; sendInput(false); }, 33 - (now - lastSentAt));
+    return;
+  }
+  ws.send(s); lastSent = s; lastSentAt = now;
 }
-setInterval(() => sendInput(true), 100);   // heartbeat so a missed message can't leave you stuck
+setInterval(() => sendInput(true), 1000);
+setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', t: performance.now() })); }, 2000);
+setInterval(() => {
+  if (!ws || ws.readyState !== 1 || kicked || !statusBase) return;
+  statusEl.textContent = statusBase + perfText.replace(/\d+ fps/, fps + ' fps');
+}, 500);   // heartbeat so a missed message can't leave you stuck
 
 window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT') return;
@@ -556,10 +626,14 @@ function updateRender(dt) {
   for (const p of players) {
     let r = render.get(p.id);
     if (!r) { r = { x: p.x, y: p.y, z: p.z, ang: 0 }; render.set(p.id, r); }
+    // updates arrive ~20x a second, so carry on along each player's velocity until the next one lands
+    const ex = Math.min(0.1, (performance.now() - stateAt) / 1000);
+    const mv = p.carried_by == null && !p.docked ? ex : 0;
+    const tx = p.x + p.vx * mv, ty = p.y + p.vy * mv, tz = p.z + p.vz * mv;
     const k = 1 - Math.pow(1e-20, dt);             // quick but smooth (~0.55 per frame at 60fps)
-    r.x += (p.x - r.x) * k; r.y += (p.y - r.y) * k; r.z += (p.z - r.z) * k;
-    if (Math.abs(p.x - r.x) > 300 || Math.abs(p.z - r.z) > 300 || Math.abs(p.y - r.y) > 300) {
-      r.x = p.x; r.y = p.y; r.z = p.z;             // teleport (reset to start)
+    r.x += (tx - r.x) * k; r.y += (ty - r.y) * k; r.z += (tz - r.z) * k;
+    if (Math.abs(tx - r.x) > 300 || Math.abs(tz - r.z) > 300 || Math.abs(ty - r.y) > 300) {
+      r.x = tx; r.y = ty; r.z = tz;                // teleport (reset to start)
       if (p.id === myId) camInit = false;
     }
     r.vx = p.vx; r.vy = p.vy; r.vz = p.vz;
@@ -806,6 +880,8 @@ function drawProgress(me) {
 let lastT = performance.now();
 function frame(now) {
   const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+  fpsFrames++;
+  if (now - fpsT >= 1000) { fps = Math.round(fpsFrames * 1000 / (now - fpsT)); fpsFrames = 0; fpsT = now; }
   arrowCamera(dt);
   updateRender(dt);
   updateCamera(dt);
