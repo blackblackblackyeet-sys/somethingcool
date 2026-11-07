@@ -35,6 +35,7 @@ Run with:  python3 server.py
 """
 import asyncio
 import base64
+import gzip
 import hashlib
 import hmac
 import json
@@ -49,6 +50,8 @@ from urllib.parse import unquote_plus
 PORT = int(os.environ.get("PORT", 3000))
 SIZE = 40                  # player cube size
 TICK_RATE = 60
+STATE_EVERY = 3            # send positions every Nth tick (3 = 20 updates/s; the page smooths in between)
+MAX_DT = 1 / 30            # if the server falls behind, take bigger steps (up to this) so the game keeps real-time speed
 
 # --- icy movement ---
 MOVE_SPEED = 520           # px/s   top speed from your own running (hold W cap)
@@ -66,8 +69,8 @@ GRAVITY = 1500             # px/s^2
 FALL_MULT = 1.25           # fall a bit faster than you rise
 JUMP_SPEED = 760           # px/s   (~4.8 blocks high, ~1s in the air)
 JUMP_CUT = 0.65            # let go of jump early: upward speed capped to this fraction
-COYOTE = 0.10              # s you can still jump after leaving a ledge
-JUMP_BUFFER = 0.12         # s a jump press is remembered before landing
+COYOTE = 0.25              # s you can still jump after leaving a ledge (generous: online lag eats into this)
+JUMP_BUFFER = 0.15         # s a jump press is remembered before landing
 MAX_FALL = 1300
 MAX_SPEED = 2600           # cap so slingshots stay sane (was 1500)
 VOID_Y = -700              # fall below this and your pair is sent back
@@ -218,6 +221,7 @@ event_seq = 0
 event_text = ""
 event_kind = "bad"
 kick_block = {}         # ip -> monotonic time the block ends
+server_load = 0.0       # ms of work per tick (smoothed), shown to players
 best_runs = []          # fastest finishes: [{"names", "time", "count"}]
 best_groups = []        # most players finished at once: same fields
 LOCAL_IPS = {"127.0.0.1", "::1"}
@@ -368,23 +372,36 @@ def reset_solo(p):
 
 
 # ---------- messaging helpers ----------
+def encode(obj):
+    return make_frame(json.dumps(obj, separators=(",", ":")).encode())
+
+
 def send_to(pid, obj):
     w = clients.get(pid)
     if w is not None and not w.is_closing():
         try:
-            w.write(make_frame(json.dumps(obj).encode()))
+            w.write(encode(obj))
         except Exception:
             pass
 
 
-def broadcast(obj):
-    frame = make_frame(json.dumps(obj).encode())
+def broadcast_text(text, droppable=False):
+    frame = make_frame(text.encode())
     for w in list(clients.values()):
-        if not w.is_closing():
-            try:
-                w.write(frame)
-            except Exception:
-                pass
+        if w.is_closing():
+            continue
+        try:
+            # A slow connection must never build up a queue of old frames (that is what makes a game
+            # feel like it lags more and more). Skip this one - the next frame is fresher anyway.
+            if droppable and w.transport.get_write_buffer_size() > 24000:
+                continue
+            w.write(frame)
+        except Exception:
+            pass
+
+
+def broadcast(obj, droppable=False):
+    broadcast_text(json.dumps(obj, separators=(",", ":")), droppable)
 
 
 def notice(pid, text):
@@ -400,6 +417,7 @@ def announce(text, kind="bad"):
     event_seq += 1
     event_text = text
     event_kind = kind
+    broadcast({"type": "event", "text": text, "kind": kind})
     print(text)
 
 
@@ -1009,43 +1027,82 @@ def tick(dt):
             reset_ids(ev["ids"])
 
 
+def topo_obj():
+    """Everything that only changes occasionally: who is here, rope shapes, who is roped to whom."""
+    return {
+        "type": "topo",
+        "players": [[p["id"], p["name"], p["color"]] for p in players.values()],
+        "ropes": [[t["id"], t["a"], t["b"], round(t["rest"]),
+                   [[round(q["x"]), round(q["z"])] for q in t["pivots"]]] for t in links.values()],
+        "groups": [[g, names_of(g)] for g in groups],
+    }
+
+
+def build_state(now):
+    """The part that changes every update: one short row per player."""
+    return {
+        "type": "s",
+        "p": [[p["id"], round(p["x"]), round(p["y"]), round(p["z"]),
+               round(p["vx"] / 10), round(p["vy"] / 10), round(p["vz"] / 10),
+               (1 if p["docked"] else 0) | (2 if p["fin"] else 0),
+               p["carried_by"] or 0, round(p["spin"] * 10)]
+              for p in players.values()],
+    }
+
+
+def dumps(obj):
+    return json.dumps(obj, separators=(",", ":"))
+
+
+last_topo = None
+last_state = None
+last_state_at = 0.0
+last_timers_at = 0.0
+
+
+def current_topo():
+    global last_topo
+    if last_topo is None:
+        last_topo = dumps(topo_obj())
+    return last_topo
+
+
+def send_world(now):
+    global last_topo, last_state, last_state_at, last_timers_at
+    topo = dumps(topo_obj())
+    if topo != last_topo:                  # rare: someone joined/left/renamed, a rope wrapped, groups changed
+        last_topo = topo
+        broadcast_text(topo)
+    st = dumps(build_state(now))
+    if st != last_state or now - last_state_at > 1.0:      # nothing moved -> send nothing (1s keepalive)
+        last_state, last_state_at = st, now
+        broadcast_text(st, droppable=True)
+    if now - last_timers_at >= 1.0:        # run timers: once a second, the page counts up in between
+        last_timers_at = now
+        broadcast({"type": "t", "a": [[p["id"], round(run_time(p, now), 1), 1 if p["fin"] else 0]
+                                      for p in players.values()]})
+
+
 async def game_loop():
-    dt = 1 / TICK_RATE
-    next_t = time.monotonic()
+    global server_load
+    step = 1 / TICK_RATE
+    last = next_t = time.monotonic()
+    n = 0
     while True:
+        t0 = time.monotonic()
+        elapsed = t0 - last
+        last = t0
+        # normally a fixed step; if we have fallen behind, take a bigger one so game speed stays real
+        dt = step if elapsed < step * 1.5 else min(elapsed, MAX_DT)
         try:
             tick(dt)
-            now = time.monotonic()
-            broadcast({
-                "type": "state",
-                "event": {"seq": event_seq, "text": event_text, "kind": event_kind},
-                "players": [
-                    {"id": p["id"], "name": p["name"], "color": p["color"],
-                     "x": round(p["x"]), "y": round(p["y"]), "z": round(p["z"]),
-                     "vx": round(p["vx"]), "vy": round(p["vy"]), "vz": round(p["vz"]),
-                     "docked": p["docked"], "carried_by": p["carried_by"],
-                     "carrying": p["carrying"], "team": p["team"],
-                     "linked": [o["id"] for o in linked_players(p)],
-                     "spin": round(p["spin"], 2), "run": round(run_time(p, now), 1)}
-                    for p in players.values()
-                ],
-                "ropes": [
-                    {"id": t["id"], "a": t["a"], "b": t["b"],
-                     "team": players[t["a"]]["team"] if t["a"] in players else None,
-                     "rope": t["rope"], "len": round(t["len"]), "rest": round(t["rest"])}
-                    for t in links.values()
-                ],
-                "groups": [
-                    {"id": g[0], "members": g, "names": names_of(g),
-                     "progs": [round(team_progress(players[i]), 4) for i in g],
-                     "fin": any(players[i]["fin"] for i in g),
-                     "fin_time": round(players[g[0]]["fin_time"], 1)}
-                    for g in groups
-                ],
-            })
+            n += 1
+            if n % STATE_EVERY == 0:
+                send_world(t0)
         except Exception:
             traceback.print_exc()
-        next_t += dt
+        server_load = server_load * 0.95 + (time.monotonic() - t0) * 1000 * 0.05
+        next_t += step
         delay = next_t - time.monotonic()
         if delay < -0.1:                 # fell far behind: don't try to catch up
             next_t = time.monotonic()
@@ -1125,12 +1182,16 @@ async def handle(reader, writer):
 
     # Plain HTTP: serve the game page
     if headers.get("upgrade", "").lower() != "websocket":
+        extra = ""
         if path in ("/", "/index.html"):
             index_path = find_index()
             if index_path:
                 with open(index_path, "rb") as f:
                     body = f.read()
                 status = "200 OK"
+                if "gzip" in headers.get("accept-encoding", "").lower():
+                    body = gzip.compress(body, 6)
+                    extra = "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n"
             else:
                 body = ("Could not find index.html. Put it in the same folder as server.py "
                         f"(looked in: {HERE}).").encode()
@@ -1139,7 +1200,7 @@ async def handle(reader, writer):
             body, status = b"Not found", "404 Not Found"
         writer.write(
             f"HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n"
-            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+            f"{extra}Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
         )
         await writer.drain()
         writer.close()
@@ -1204,6 +1265,7 @@ async def handle(reader, writer):
         "tether_rest": TETHER_REST, "grab_range": GRAB_RANGE, "link_range": LINK_RANGE,
         "scores": scores_msg(),
     }).encode()))
+    writer.write(make_frame(dumps(topo_obj()).encode()))
 
     try:
         while True:
@@ -1236,6 +1298,10 @@ async def handle(reader, writer):
                     me["name"] = clean_name(msg.get("name", ""), f"P{pid}")
                     if me["name"] != old:
                         print(f"{old} is now called {me['name']}")
+                elif kind == "ping":
+                    t = msg.get("t")
+                    if isinstance(t, (int, float)) and not isinstance(t, bool):
+                        send_to(pid, {"type": "pong", "t": t, "load": round(server_load, 1)})
                 elif kind == "chat":
                     text = clean_chat(msg.get("text", ""))
                     now = time.monotonic()
