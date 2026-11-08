@@ -50,7 +50,10 @@ from urllib.parse import unquote_plus
 PORT = int(os.environ.get("PORT", 3000))
 SIZE = 40                  # player cube size
 TICK_RATE = 60
-STATE_EVERY = 3            # send positions every Nth tick (3 = 20 updates/s; the page smooths in between)
+STATE_EVERY = 3            # fastest position updates: every 3rd tick = 20 per second
+STATE_EVERY_MAX = 6        # slowest (10 per second) - used automatically when many players are online
+STATE_BUDGET = 12000       # bytes/s of position traffic to stay under (~5 GB/month at ~108 hours of play)
+STATE_ROW = 15             # bytes per player in a position update
 MAX_DT = 1 / 30            # if the server falls behind, take bigger steps (up to this) so the game keeps real-time speed
 
 # --- icy movement ---
@@ -386,7 +389,14 @@ def send_to(pid, obj):
 
 
 def broadcast_text(text, droppable=False):
-    frame = make_frame(text.encode())
+    broadcast_frame(make_frame(text.encode()), droppable)
+
+
+def broadcast_binary(data, droppable=False):
+    broadcast_frame(make_frame(data, 2), droppable)
+
+
+def broadcast_frame(frame, droppable=False):
     for w in list(clients.values()):
         if w.is_closing():
             continue
@@ -1027,27 +1037,41 @@ def tick(dt):
             reset_ids(ev["ids"])
 
 
-def topo_obj():
-    """Everything that only changes occasionally: who is here, rope shapes, who is roped to whom."""
+def piv_of(t):
+    return [[round(q["x"]), round(q["z"])] for q in t["pivots"]]
+
+
+def topo_obj(with_pivots=False):
+    """Everything that only changes occasionally: who is here, who is roped to whom.
+    (Rope wrap points are sent separately, only when a rope actually wraps or unwraps.)"""
     return {
         "type": "topo",
         "players": [[p["id"], p["name"], p["color"]] for p in players.values()],
-        "ropes": [[t["id"], t["a"], t["b"], round(t["rest"]),
-                   [[round(q["x"]), round(q["z"])] for q in t["pivots"]]] for t in links.values()],
+        "ropes": [[t["id"], t["a"], t["b"], round(t["rest"])] + ([piv_of(t)] if with_pivots else [])
+                  for t in links.values()],
         "groups": [[g, names_of(g)] for g in groups],
     }
 
 
-def build_state(now):
-    """The part that changes every update: one short row per player."""
-    return {
-        "type": "s",
-        "p": [[p["id"], round(p["x"]), round(p["y"]), round(p["z"]),
-               round(p["vx"] / 10), round(p["vy"] / 10), round(p["vz"] / 10),
-               (1 if p["docked"] else 0) | (2 if p["fin"] else 0),
-               p["carried_by"] or 0, round(p["spin"] * 10)]
-              for p in players.values()],
-    }
+ROW = struct.Struct(">HhhhbbbBHb")      # id, x, y, z, vx/21, vy/21, vz/21, flags, carried_by, spin*10  = 15 bytes
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def build_state():
+    """The part that changes every update: one 15-byte row per player, as raw bytes."""
+    out = bytearray()
+    for p in players.values():
+        out += ROW.pack(
+            p["id"] & 0xFFFF,
+            clamp(round(p["x"]), -32000, 32000), clamp(round(p["y"]), -32000, 32000), clamp(round(p["z"]), -32000, 32000),
+            clamp(round(p["vx"] / 21), -127, 127), clamp(round(p["vy"] / 21), -127, 127), clamp(round(p["vz"] / 21), -127, 127),
+            (1 if p["docked"] else 0) | (2 if p["fin"] else 0),
+            (p["carried_by"] or 0) & 0xFFFF,
+            clamp(round(p["spin"] * 10), -127, 127))
+    return bytes(out)
 
 
 def dumps(obj):
@@ -1057,28 +1081,45 @@ def dumps(obj):
 last_topo = None
 last_state = None
 last_state_at = 0.0
+last_timers = None
 last_timers_at = 0.0
+last_piv = {}
 
 
-def current_topo():
-    global last_topo
-    if last_topo is None:
-        last_topo = dumps(topo_obj())
-    return last_topo
+def state_every():
+    """Ticks between position updates. Traffic grows with the SQUARE of the player count (everyone gets a
+    row for everyone), so with lots of players the server slows down to stay inside STATE_BUDGET."""
+    k = len(players)
+    if k < 2:
+        return STATE_EVERY
+    per_update = k * (STATE_ROW * k + 12)
+    return max(STATE_EVERY, min(STATE_EVERY_MAX, math.ceil(TICK_RATE * per_update / STATE_BUDGET)))
 
 
 def send_world(now):
-    global last_topo, last_state, last_state_at, last_timers_at
+    global last_topo, last_state, last_state_at, last_timers, last_timers_at
     topo = dumps(topo_obj())
-    if topo != last_topo:                  # rare: someone joined/left/renamed, a rope wrapped, groups changed
+    if topo != last_topo:                  # rare: someone joined/left/renamed, groups or rope lengths changed
         last_topo = topo
         broadcast_text(topo)
-    st = dumps(build_state(now))
+    changed = []                           # rope wrap points: only when a rope wraps or unwraps
+    for t in links.values():
+        piv = piv_of(t)
+        key = dumps(piv)
+        if last_piv.get(t["id"], "[]") != key:
+            changed.append([t["id"], piv])
+        last_piv[t["id"]] = key
+    for lid in [l for l in last_piv if l not in links]:
+        del last_piv[lid]
+    if changed:
+        broadcast_text(dumps({"type": "r", "r": changed}))
+    st = build_state()
     if st != last_state or now - last_state_at > 1.0:      # nothing moved -> send nothing (1s keepalive)
         last_state, last_state_at = st, now
-        broadcast_text(st, droppable=True)
-    if now - last_timers_at >= 1.0:        # run timers: once a second, the page counts up in between
-        last_timers_at = now
+        broadcast_binary(st, droppable=True)
+    sig = tuple((p["id"], round(p["run_start"], 1), p["fin"]) for p in players.values())
+    if sig != last_timers or now - last_timers_at >= 10.0:  # run timers: only on a reset; the page counts up between
+        last_timers, last_timers_at = sig, now
         broadcast({"type": "t", "a": [[p["id"], round(run_time(p, now), 1), 1 if p["fin"] else 0]
                                       for p in players.values()]})
 
@@ -1097,7 +1138,8 @@ async def game_loop():
         try:
             tick(dt)
             n += 1
-            if n % STATE_EVERY == 0:
+            if n >= state_every():
+                n = 0
                 send_world(t0)
         except Exception:
             traceback.print_exc()
@@ -1265,7 +1307,7 @@ async def handle(reader, writer):
         "tether_rest": TETHER_REST, "grab_range": GRAB_RANGE, "link_range": LINK_RANGE,
         "scores": scores_msg(),
     }).encode()))
-    writer.write(make_frame(dumps(topo_obj()).encode()))
+    writer.write(make_frame(dumps(topo_obj(with_pivots=True)).encode()))
 
     try:
         while True:
