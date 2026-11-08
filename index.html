@@ -111,7 +111,7 @@ let groups = [];
 let lastEventSeq = null, bannerText = '', bannerUntil = 0, bannerKind = 'bad';
 let ws, kicked = false, hostNote = '', statusBase = '', perfText = '';
 let stateAt = 0, rtt = 0, serverMs = 0, fps = 0, fpsFrames = 0, fpsT = performance.now();
-let roster = new Map(), ropeTopo = [], groupTopo = [], teamOf = new Map(), linkedOf = new Map(), timers = new Map(), lastP = null;
+let pivOf = new Map(), roster = new Map(), ropeTopo = [], groupTopo = [], teamOf = new Map(), linkedOf = new Map(), timers = new Map(), lastP = null;
 const bubbles = new Map();    // player id -> { text, until }
 
 const render = new Map();     // id -> smoothed drawing state
@@ -208,7 +208,7 @@ function applyState() {
     const info = roster.get(a[0]) || { name: 'P' + a[0], color: '#999999' };
     const tm = timers.get(a[0]);
     return { id: a[0], name: info.name, color: info.color, x: a[1], y: a[2], z: a[3],
-             vx: a[4] * 10, vy: a[5] * 10, vz: a[6] * 10, docked: !!(a[7] & 1), fin: !!(a[7] & 2),
+             vx: a[4] * 21, vy: a[5] * 21, vz: a[6] * 21, docked: !!(a[7] & 1), fin: !!(a[7] & 2),
              carried_by: a[8] || null, carrying: null, spin: a[9] / 10,
              team: teamOf.has(a[0]) ? teamOf.get(a[0]) : null, linked: linkedOf.get(a[0]) || [],
              run: tm ? tm.run + (tm.fin ? 0 : (now - tm.at) / 1000) : 0 };
@@ -242,10 +242,23 @@ function applyState() {
   updateHostPanel();
 }
 
+// positions arrive as raw bytes: 15 per player (id, x, y, z, vx/21, vy/21, vz/21, flags, carried_by, spin*10)
+function onBinaryState(buf) {
+  const dv = new DataView(buf), rows = [];
+  for (let o = 0; o + 15 <= dv.byteLength; o += 15) {
+    rows.push([dv.getUint16(o), dv.getInt16(o + 2), dv.getInt16(o + 4), dv.getInt16(o + 6),
+               dv.getInt8(o + 8), dv.getInt8(o + 9), dv.getInt8(o + 10), dv.getUint8(o + 11),
+               dv.getUint16(o + 12), dv.getInt8(o + 14)]);
+  }
+  lastP = rows; stateAt = performance.now();
+  applyState();
+}
+
 // ================= connection =================
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/${location.search}`);
+  ws.binaryType = 'arraybuffer';
   ws.onopen = () => { statusEl.textContent = 'Connected'; sendName(); };
   ws.onclose = () => {
     players = []; ropes = []; groups = []; render.clear(); camInit = false; statusBase = ''; lastP = null;
@@ -254,6 +267,7 @@ function connect() {
     setTimeout(connect, 1500);
   };
   ws.onmessage = (e) => {
+    if (typeof e.data !== 'string') { onBinaryState(e.data); return; }
     const msg = JSON.parse(e.data);
     if (msg.type === 'welcome') {
       myId = msg.id; size = msg.size; rest = msg.tether_rest; grabRange = msg.grab_range; linkRange = msg.link_range;
@@ -267,7 +281,8 @@ function connect() {
       if (hostNote) { bannerText = 'Host key not accepted - see the status line below the game'; bannerKind = 'bad'; bannerUntil = performance.now() + 15000; }
     } else if (msg.type === 'topo') {            // rarely: who is here, rope shapes, who is roped to whom
       roster = new Map(msg.players.map((q) => [q[0], { name: q[1], color: q[2] }]));
-      ropeTopo = msg.ropes.map((r) => ({ id: r[0], a: r[1], b: r[2], rest: r[3], piv: r[4] }));
+      ropeTopo = msg.ropes.map((r) => ({ id: r[0], a: r[1], b: r[2], rest: r[3], piv: r[4] || pivOf.get(r[0]) || [] }));
+      pivOf = new Map(ropeTopo.map((r) => [r.id, r.piv]));
       groupTopo = msg.groups.map((g) => ({ members: g[0], names: g[1] }));
       teamOf = new Map(); linkedOf = new Map();
       for (const g of groupTopo) for (const id of g.members) teamOf.set(id, g.members[0]);
@@ -280,6 +295,9 @@ function connect() {
     } else if (msg.type === 's') {               // ~20x a second: one short row per player
       lastP = msg.p; stateAt = performance.now();
       applyState();
+    } else if (msg.type === 'r') {               // a rope wrapped or unwrapped
+      for (const [id, piv] of msg.r) { pivOf.set(id, piv); const r = ropeTopo.find((x) => x.id === id); if (r) r.piv = piv; }
+      if (lastP) applyState();
     } else if (msg.type === 't') {               // once a second: run timers
       const at = performance.now();
       timers = new Map(msg.a.map((a) => [a[0], { run: a[1], fin: a[2], at }]));
@@ -334,7 +352,7 @@ function sendInput(force) {
   ws.send(s); lastSent = s; lastSentAt = now;
 }
 setInterval(() => sendInput(true), 1000);
-setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', t: performance.now() })); }, 2000);
+setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', t: performance.now() })); }, 5000);
 setInterval(() => {
   if (!ws || ws.readyState !== 1 || kicked || !statusBase) return;
   statusEl.textContent = statusBase + perfText.replace(/\d+ fps/, fps + ' fps');
@@ -627,7 +645,7 @@ function updateRender(dt) {
     let r = render.get(p.id);
     if (!r) { r = { x: p.x, y: p.y, z: p.z, ang: 0 }; render.set(p.id, r); }
     // updates arrive ~20x a second, so carry on along each player's velocity until the next one lands
-    const ex = Math.min(0.1, (performance.now() - stateAt) / 1000);
+    const ex = Math.min(0.15, (performance.now() - stateAt) / 1000);
     const mv = p.carried_by == null && !p.docked ? ex : 0;
     const tx = p.x + p.vx * mv, ty = p.y + p.vy * mv, tz = p.z + p.vz * mv;
     const k = 1 - Math.pow(1e-20, dt);             // quick but smooth (~0.55 per frame at 60fps)
