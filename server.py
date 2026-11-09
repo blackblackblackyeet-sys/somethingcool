@@ -99,6 +99,8 @@ GRAB_RANGE = 90            # px between cube centres
 GRAB_COOLDOWN = 0.6        # s before someone you just dropped/threw can be re-grabbed
 THROW_X = 450
 THROW_Y = 350
+THROW_CAP = 1300      # max horizontal speed a throw can give
+THROW_VY_CAP = 1000
 
 FINISH_PAUSE = 2.5         # s the finishing pair sees their time before going back to the start
 
@@ -124,8 +126,19 @@ GAP_W = 900                # width of the gap (needs a slingshot to cross)
 LAND_X = GAP_X0 + GAP_W
 RUNOUT = 900               # flat landing/braking zone before the next hazard
 OFF = LAND_X + RUNOUT - 2100   # everything after the gap is shifted by this
-FINISH_X = 4300 + OFF      # the finish line
-END_X = 4540 + OFF
+F_X0 = 4250 + OFF          # stepping-stone void (not too wide to jump, but one slip and you restart)
+F_X1 = F_X0 + 760
+FINISH_X = 5650 + OFF      # the finish line
+END_X = FINISH_X + 240
+
+# level 2 ("Sky Tower") lives far along the x axis so both levels share one physics world
+L2_OX = 20000
+L2_END = 4300
+L2_STEPS = [150, 400, 650, 900, 1150, 1400, 1650]   # top of each block. A solo jump reaches ~186 (not enough);
+#   a carry-hop or throw reaches ~410, and whoever is up top can grab a jumping friend from above
+L2_STEP_X = 600            # first block starts here (relative to L2_OX); each next one is 450 further on
+L2_STEP_DX = 450
+FINISH_Y = L2_STEPS[-1]
 
 
 def build_level():
@@ -139,7 +152,11 @@ def build_level():
 
     # floor, with the big void gap
     box(0, GAP_X0, -40, 0, -HALF_W, HALF_W, K_SOLID)
-    box(LAND_X, END_X, -40, 0, -HALF_W, HALF_W, K_SOLID)
+    box(LAND_X, F_X0, -40, 0, -HALF_W, HALF_W, K_SOLID)
+    for i in range(4):                      # F: four stepping stones over the void
+        sx = F_X0 + 60 + i * 175
+        box(sx, sx + 110, -40, 0, -HALF_W, HALF_W, K_SOLID)
+    box(F_X1, END_X, -40, 0, -HALF_W, HALF_W, K_SOLID)
 
     # tall bouncy boundary walls
     box(-40, 0, 0, 700, -HALF_W - 40, HALF_W + 40, K_EDGE)
@@ -178,6 +195,10 @@ def build_level():
                  (4100, -300), (4100, 50)):
         pole(x + OFF, z)
 
+    # G: last pole field before the finish
+    for x, z in ((5050, -300), (5050, 100), (5200, -100), (5200, 300), (5350, -300), (5350, 0), (5500, 200)):
+        pole(x + OFF, z)
+
     # finish arch
     pole(FINISH_X, -460, 340)
     pole(FINISH_X, 460, 340)
@@ -186,7 +207,36 @@ def build_level():
     return B
 
 
-BOXES = build_level()
+def build_level2():
+    B = []
+    ox = L2_OX
+    H = 2600
+
+    def box(x0, x1, y0, y1, z0, z1, k):
+        B.append((ox + x0, y0, z0, ox + x1, y1, z1, k))
+
+    box(0, L2_END, -40, 0, -HALF_W, HALF_W, K_SOLID)
+    box(-40, 0, 0, H, -HALF_W - 40, HALF_W + 40, K_EDGE)
+    box(-40, L2_END + 40, 0, H, -HALF_W - 40, -HALF_W, K_EDGE)
+    box(-40, L2_END + 40, 0, H, HALF_W, HALF_W + 40, K_EDGE)
+    box(L2_END, L2_END + 40, 0, H, -HALF_W, HALF_W, K_EDGE)
+    box(280, 300, 0, 2, -HALF_W, HALF_W, K_WHITE)
+    for k, top in enumerate(L2_STEPS):
+        x0 = L2_STEP_X + k * L2_STEP_DX
+        box(x0, L2_END, 0, top, -HALF_W, HALF_W, K_SOLID)
+        box(x0 - 30, x0, top - 2, top, -HALF_W, HALF_W, K_GOLD if k == len(L2_STEPS) - 1 else K_WHITE)
+    return B
+
+
+LEVELS = {
+    1: {"name": "Mixed Run", "desc": "Poles, a slingshot gap, spikes, walls, stepping stones", "ox": 0,
+        "start_x": START_X, "axis": "x", "finish": FINISH_X, "min_x": -60, "max_x": END_X + 60},
+    2: {"name": "Sky Tower", "desc": "Climb! Carry-hop or throw a friend up, then they grab you from above", "ox": L2_OX,
+        "start_x": L2_OX + START_X, "axis": "y", "finish": FINISH_Y, "min_x": L2_OX - 60,
+        "max_x": L2_OX + L2_END + 60},
+}
+
+BOXES = build_level() + build_level2()
 SOLIDS = [b for b in BOXES if b[6] in (K_SOLID, K_POLE, K_WALL, K_EDGE)]
 SPIKES = [b for b in BOXES if b[6] == K_SPIKE]
 # footprints the tether can wrap around: (x0, z0, x1, z1, y0, y1)
@@ -225,8 +275,6 @@ event_text = ""
 event_kind = "bad"
 kick_block = {}         # ip -> monotonic time the block ends
 server_load = 0.0       # ms of work per tick (smoothed), shown to players
-best_runs = []          # fastest finishes: [{"names", "time", "count"}]
-best_groups = []        # most players finished at once: same fields
 LOCAL_IPS = {"127.0.0.1", "::1"}
 HOST_KEY = os.environ.get("HOST_KEY", "").strip()   # when hosted online: open /?host=<key> to be the host
 
@@ -244,7 +292,7 @@ def clean_chat(raw):
 def new_player(pid, ip="?", host=False):
     return {
         "id": pid, "name": f"P{pid}", "ip": ip, "host": host,
-        "x": START_X, "y": 0.0, "z": lane_z(pid),
+        "x": START_X, "y": 0.0, "z": lane_z(pid), "lv": 1,
         "vx": 0.0, "vy": 0.0, "vz": 0.0,
         "on_ground": False, "docked": False, "spin": 0.0, "lean": None,
         "coyote": 0.0, "jump_buf": 0.0, "jump_prev": False, "jump_edge": False,
@@ -363,7 +411,7 @@ def reset_ids(ids):
     z0 = lane_z(ps[0]["id"])
     for i, p in enumerate(ps):
         z = z0 + (i - (n - 1) / 2) * 56
-        place(p, START_X, max(-HALF_W + 20, min(HALF_W - 20 - SIZE, z)))
+        place(p, LEVELS[p["lv"]]["start_x"], max(-HALF_W + 20, min(HALF_W - 20 - SIZE, z)))
     idset = {p["id"] for p in ps}
     for l in links.values():
         if l["a"] in idset or l["b"] in idset:
@@ -371,7 +419,7 @@ def reset_ids(ids):
 
 
 def reset_solo(p):
-    place(p, START_X, lane_z(p["id"]))
+    place(p, LEVELS[p["lv"]]["start_x"], lane_z(p["id"]))
 
 
 # ---------- messaging helpers ----------
@@ -422,62 +470,90 @@ def sys_chat(text):
     broadcast({"type": "chat", "id": 0, "name": "", "color": "#999", "text": text, "sys": True})
 
 
-def announce(text, kind="bad"):
+def broadcast_level(obj, lv):
+    """Send to everyone currently playing level lv."""
+    for pid, p in list(players.items()):
+        if p["lv"] == lv:
+            send_to(pid, obj)
+
+
+def announce(text, kind="bad", lv=None):
     global event_seq, event_text, event_kind
     event_seq += 1
     event_text = text
     event_kind = kind
-    broadcast({"type": "event", "text": text, "kind": kind})
+    if lv is None:
+        broadcast({"type": "event", "text": text, "kind": kind})
+    else:
+        broadcast_level({"type": "event", "text": text, "kind": kind}, lv)
     print(text)
 
 
-# ---------- scoreboards ----------
-def sort_scores():
+# ---------- scoreboards (one pair per level) ----------
+best_runs = {lv: [] for lv in LEVELS}      # fastest finishes: [{"names", "time", "count"}]
+best_groups = {lv: [] for lv in LEVELS}    # most players finished at once: same fields
+
+
+def sort_scores(lv):
     # fastest: quickest time wins, more players wins a tie
-    best_runs.sort(key=lambda e: (e["time"], -e["count"]))
+    best_runs[lv].sort(key=lambda e: (e["time"], -e["count"]))
     # most players at once: biggest group wins, quicker time wins a tie
-    best_groups.sort(key=lambda e: (-e["count"], e["time"]))
-    del best_runs[10:]
-    del best_groups[10:]
+    best_groups[lv].sort(key=lambda e: (-e["count"], e["time"]))
+    del best_runs[lv][10:]
+    del best_groups[lv][10:]
+
+
+def _clean_entries(raw):
+    out = []
+    for e in raw or []:
+        if isinstance(e, dict) and "names" in e and "time" in e:
+            try:
+                out.append({"names": str(e["names"])[:60], "time": float(e["time"]), "count": int(e.get("count", 2))})
+            except (TypeError, ValueError):
+                pass
+    return out
 
 
 def load_scores():
     try:
         with open(SCORES_FILE) as f:
             data = json.load(f)
-        for key, dest, fallback in (("fastest", best_runs, []), ("most", best_groups, data.get("fastest", []))):
-            for e in data.get(key, fallback):
-                if isinstance(e, dict) and "names" in e and "time" in e:
-                    dest.append({"names": str(e["names"])[:60], "time": float(e["time"]),
-                                 "count": int(e.get("count", 2))})
-        sort_scores()
+        if "levels" in data:
+            for lv in LEVELS:
+                d = data["levels"].get(str(lv), {})
+                best_runs[lv].extend(_clean_entries(d.get("fastest")))
+                best_groups[lv].extend(_clean_entries(d.get("most")))
+        else:                                  # old single-level file = level 1
+            best_runs[1].extend(_clean_entries(data.get("fastest")))
+            best_groups[1].extend(_clean_entries(data.get("most", data.get("fastest"))))
+        for lv in LEVELS:
+            sort_scores(lv)
         print(f"Loaded scores from {SCORES_FILE}")
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError):
         pass
 
 
 def save_scores():
     try:
         with open(SCORES_FILE, "w") as f:
-            json.dump({"fastest": best_runs, "most": best_groups}, f)
+            json.dump({"levels": {str(lv): {"fastest": best_runs[lv], "most": best_groups[lv]} for lv in LEVELS}}, f)
     except OSError:
         pass
 
 
-def scores_msg():
-    return {"type": "scores", "fastest": best_runs[:5], "most": best_groups[:5]}
+def scores_msg(lv):
+    return {"type": "scores", "lv": lv, "fastest": best_runs[lv][:5], "most": best_groups[lv][:5]}
 
 
-def record_finish(ids, secs):
+def record_finish(ids, secs, lv=1):
     entry = {"names": names_of(ids), "time": round(secs, 2), "count": len(ids)}
-    best_runs.append(dict(entry))
-    best_groups.append(dict(entry))
-    sort_scores()
+    best_runs[lv].append(dict(entry))
+    best_groups[lv].append(dict(entry))
+    sort_scores(lv)
     save_scores()
-    broadcast(scores_msg())
+    broadcast(scores_msg(lv))
 
 
-# ---------- tethering (Q) ----------
 def link(a, b):
     """Rope two players together. Returns the new rope (None if they already have one)."""
     global next_link
@@ -490,7 +566,7 @@ def link(a, b):
     compute_groups()
     # roping up while everyone is still behind the start line restarts the run timers
     members = group_of(a)
-    if all(p["x"] + SIZE / 2 < START_LINE_X for p in members):
+    if all(p["x"] + SIZE / 2 < START_LINE_X + LEVELS[p["lv"]]["ox"] for p in members):
         now = time.monotonic()
         for p in members:
             p["run_start"] = now
@@ -510,6 +586,23 @@ def unlink(t):
     compute_groups()
 
 
+def set_level(p, lv):
+    """Move a player to another level: they leave their ropes behind and start fresh there."""
+    for t in [t for t in links.values() if p["id"] in (t["a"], t["b"])]:
+        unlink(t)
+    if p["carrying"] is not None:
+        detach(p, "drop")
+    if p["carried_by"] is not None:
+        c = players.get(p["carried_by"])
+        if c is not None:
+            detach(c, "drop")
+    p["lv"] = lv
+    p["fin"] = False
+    p["no_grab"] = False
+    reset_solo(p)
+    sys_chat(f"{p['name']} went to {LEVELS[lv]['name']}")
+
+
 def handle_links():
     """Q toggles a rope to the NEAREST player."""
     for p in list(players.values()):
@@ -518,7 +611,7 @@ def handle_links():
         p["link_cd"] = LINK_COOLDOWN
         pc = center(p)
         near = sorted(((math.dist(pc, center(q)), q) for q in players.values()
-                       if q is not p and math.dist(pc, center(q)) <= LINK_RANGE),
+                       if q is not p and q["lv"] == p["lv"] and math.dist(pc, center(q)) <= LINK_RANGE),
                       key=lambda e: e[0])
         if not near:
             notice(p["id"], "Nobody close enough - get next to a player and press Q")
@@ -557,6 +650,8 @@ def detach(c, mode="drop"):
         return
     r["carried_by"] = None
     r["grab_cd"] = GRAB_COOLDOWN
+    r["no_grab"] = True          # a thrown/dropped player can't grab anyone until they land
+    c["grab_cd"] = GRAB_COOLDOWN * 2
     px, py, pz = c["x"], c["y"] + SIZE + 2, c["z"]
     if not free_at(px, py, pz):
         px, py, pz = c["x"], c["y"], c["z"]
@@ -576,11 +671,19 @@ def detach(c, mode="drop"):
             r["vx"] = c["vx"] + mx / m * THROW_X
             r["vz"] = c["vz"] + mz / m * THROW_X
             r["vy"] = max(c["vy"], 0.0) + THROW_Y
+            hs = math.hypot(r["vx"], r["vz"])
+            if hs > THROW_CAP:
+                r["vx"] *= THROW_CAP / hs
+                r["vz"] *= THROW_CAP / hs
+            r["vy"] = min(r["vy"], THROW_VY_CAP)
     elif mode == "jump":
         r["vy"] = JUMP_SPEED
 
 
 def handle_carry():
+    for p in players.values():
+        if p.get("no_grab") and p["on_ground"] and p["carried_by"] is None:
+            p["no_grab"] = False
     # let go of the grab key -> throw whoever you were carrying
     for c in list(players.values()):
         if c["carrying"] is not None and not c["input"]["grab"]:
@@ -593,7 +696,7 @@ def handle_carry():
                 detach(c, "jump")
     # holding grab near a tethered friend picks them up (so you can catch them mid-flight)
     for c in list(players.values()):
-        if not c["input"]["grab"] or c["carrying"] is not None or c["carried_by"] is not None:
+        if not c["input"]["grab"] or c["carrying"] is not None or c["carried_by"] is not None or c.get("no_grab"):
             continue
         q, qd = None, GRAB_RANGE
         for o in linked_players(c):
@@ -969,7 +1072,8 @@ def step_player(p, dt):
 
 
 def hit_hazard(p):
-    if p["y"] < VOID_Y or p["x"] < -60 or abs(p["z"]) > HALF_W + 60:
+    lv = LEVELS[p["lv"]]
+    if p["y"] < VOID_Y or p["x"] < lv["min_x"] or p["x"] > lv["max_x"] or abs(p["z"]) > HALF_W + 60:
         return "fell out of the arena"
     for b in SPIKES:
         if (p["x"] + 6 < b[3] and p["x"] + SIZE - 6 > b[0] and
@@ -979,8 +1083,11 @@ def hit_hazard(p):
     return None
 
 
-def team_progress(p):
-    return max(0.0, min(1.0, (p["x"] + SIZE / 2 - START_X) / (FINISH_X - START_X)))
+def reached_finish(p):
+    lv = LEVELS[p["lv"]]
+    if lv["axis"] == "y":
+        return p["y"] >= lv["finish"] - 1 and p["on_ground"]
+    return p["x"] + SIZE / 2 >= lv["finish"]
 
 
 def run_time(p, now):
@@ -1010,10 +1117,10 @@ def tick(dt):
         if why:
             g = [q["id"] for q in group_of(p)]
             if len(g) > 1:
-                announce(f"{p['name']} {why}! {names_of(g)} back to the start")
+                announce(f"{p['name']} {why}! {names_of(g)} back to the start", lv=p["lv"])
                 reset_ids(g)
             else:
-                announce(f"{p['name']} {why}! Back to the start")
+                announce(f"{p['name']} {why}! Back to the start", lv=p["lv"])
                 reset_solo(p)
 
     # finish: the WHOLE group over the line -> only that group resets
@@ -1022,15 +1129,16 @@ def tick(dt):
         ps = [players[i] for i in g if i in players]
         if len(ps) < 2 or any(p["fin"] for p in ps):
             continue
-        if all(p["x"] + SIZE / 2 >= FINISH_X for p in ps):
+        if len({p["lv"] for p in ps}) == 1 and all(reached_finish(p) for p in ps):
+            lvn = ps[0]["lv"]
             secs = now - min(p["run_start"] for p in ps)
             for p in ps:
                 p["fin"] = True
                 p["fin_time"] = secs
             finish_events.append({"ids": list(g), "until": now + FINISH_PAUSE})
-            record_finish(g, secs)
-            announce(f"{names_of(g)} finished in {secs:.1f}s!", "good")
-            sys_chat(f"{names_of(g)} finished in {secs:.1f}s!")
+            record_finish(g, secs, lvn)
+            announce(f"{names_of(g)} finished in {secs:.1f}s!", "good", lv=lvn)
+            sys_chat(f"{names_of(g)} finished {LEVELS[lvn]['name']} in {secs:.1f}s!")
     for ev in list(finish_events):
         if now >= ev["until"]:
             finish_events.remove(ev)
@@ -1046,7 +1154,7 @@ def topo_obj(with_pivots=False):
     (Rope wrap points are sent separately, only when a rope actually wraps or unwraps.)"""
     return {
         "type": "topo",
-        "players": [[p["id"], p["name"], p["color"]] for p in players.values()],
+        "players": [[p["id"], p["name"], p["color"], p["lv"]] for p in players.values()],
         "ropes": [[t["id"], t["a"], t["b"], round(t["rest"])] + ([piv_of(t)] if with_pivots else [])
                   for t in links.values()],
         "groups": [[g, names_of(g)] for g in groups],
@@ -1303,9 +1411,11 @@ async def handle(reader, writer):
     writer.write(make_frame(json.dumps({
         "type": "welcome", "id": pid, "size": SIZE, "host": is_host, "host_status": host_status,
         "boxes": [list(b) for b in BOXES],
-        "start_x": START_X, "finish_x": FINISH_X, "half_w": HALF_W,
+        "half_w": HALF_W, "lv": 1,
+        "levels": [dict(id=k, name=v["name"], desc=v["desc"], ox=v["ox"], start=v["start_x"], axis=v["axis"],
+                        finish=v["finish"]) for k, v in LEVELS.items()],
         "tether_rest": TETHER_REST, "grab_range": GRAB_RANGE, "link_range": LINK_RANGE,
-        "scores": scores_msg(),
+        "scores": [scores_msg(lv) for lv in LEVELS],
     }).encode()))
     writer.write(make_frame(dumps(topo_obj(with_pivots=True)).encode()))
 
@@ -1335,6 +1445,14 @@ async def handle(reader, writer):
                         "grab": bool(msg.get("grab")),
                         "link": bool(msg.get("link")),
                     }
+                elif kind == "level":
+                    try:
+                        want = int(msg.get("lv"))
+                    except (TypeError, ValueError):
+                        want = 0
+                    if want in LEVELS and want != me["lv"] and time.monotonic() - me.get("lv_at", 0) > 0.8:
+                        me["lv_at"] = time.monotonic()
+                        set_level(me, want)
                 elif kind == "name":
                     old = me["name"]
                     me["name"] = clean_name(msg.get("name", ""), f"P{pid}")
