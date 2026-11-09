@@ -33,6 +33,12 @@
   #namebar { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; font-size: 14px; }
   #namebar input { padding: 6px 8px; border-radius: 6px; border: 1px solid #555; background: #2a2a38; color: #fff; width: 140px; }
   #namebar button { padding: 6px 12px; border-radius: 6px; border: 0; background: #4a6fd8; color: #fff; cursor: pointer; }
+  #levels { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 8px; }
+  #levels button { padding: 7px 14px; border-radius: 8px; border: 1px solid #555; background: #2a2a38; color: #ccd;
+                   cursor: pointer; font-size: 13.5px; text-align: left; line-height: 1.3; }
+  #levels button small { display: block; color: #99a; font-size: 11.5px; }
+  #levels button.on { background: #4a6fd8; border-color: #7f9cf0; color: #fff; }
+  #levels button.on small { color: #dde; }
   #status { margin: 6px 0; font-size: 13px; color: #aab; }
   p.help { max-width: 1100px; text-align: center; font-size: 13.5px; line-height: 1.6; margin: 8px 0 0; }
   kbd { background: #333; border: 1px solid #555; border-radius: 4px; padding: 0 5px; font-size: 12px; }
@@ -56,8 +62,8 @@
   </div>
   <div id="side">
     <div class="panel" id="hostpanel"><h3>Host: kick players</h3><div id="hostlist"></div></div>
-    <div class="panel"><h3>Fastest finish</h3><ol id="sb-fast"></ol></div>
-    <div class="panel"><h3>Most players finished</h3><ol id="sb-most"></ol></div>
+    <div class="panel"><h3>Fastest finish <span class="lvname"></span></h3><ol id="sb-fast"></ol></div>
+    <div class="panel"><h3>Most players finished <span class="lvname"></span></h3><ol id="sb-most"></ol></div>
     <div class="panel" id="chatpanel">
       <h3>Chat</h3>
       <div id="chatlog"></div>
@@ -65,6 +71,7 @@
     </div>
   </div>
 </div>
+<div id="levels"></div>
 <div id="nogl">Your browser couldn't start WebGL, which this game needs. Try a recent Chrome, Safari or Firefox.</div>
 <div id="status">Connecting...</div>
 <p class="help">
@@ -77,7 +84,8 @@
   <b>Camera:</b> drag the mouse or arrow keys.<br>
   Tether up with as many friends as you like (<kbd>Q</kbd> toggles a rope to the nearest player). Everyone roped together must reach the finish, and the more of you there are, the shorter the ropes get. A spike or the void sends the whole group back to the start.
   Big gap? Dock, have your partner run away to stretch the rope, then let go - they fly back at you.
-  Hold <kbd>E</kbd> to grab them as they pass, jump together, and the rider can hit <kbd>Space</kbd> mid-air for a second hop.
+  Hold <kbd>E</kbd> to grab them as they pass, jump together, and the rider can hit <kbd>Space</kbd> mid-air for a second hop.<br>
+  <b>Levels:</b> pick one with the buttons under the game - each has its own scoreboards. In Sky Tower, carry a friend (<kbd>E</kbd>), jump, and they hop off your head onto the ledge; then they stand at the edge holding <kbd>E</kbd> and catch you as you jump.
 </p>
 
 <script>
@@ -104,6 +112,8 @@ const W = glc.width, H = glc.height;
 let myId = null, isHost = false;
 let size = 40, rest = 280, grabRange = 90, linkRange = 130;
 let startX = 150, finishX = 4300, halfW = 500;
+let levels = [], myLv = 1, lvAxis = 'x', lvOx = 0, scoreData = {};
+const levelBar = document.getElementById('levels');
 let boxes = [];
 let players = [];
 let ropes = [];
@@ -165,9 +175,51 @@ function fillList(id, rows) {
   });
 }
 function showScores(s) {
+  if (s && s.lv != null) scoreData[s.lv] = s;
+  s = scoreData[myLv] || {};
+  const L = levels.find((l) => l.id === myLv);
+  for (const el of document.querySelectorAll('.lvname')) el.textContent = L ? '\u00b7 ' + L.name : '';
   fillList('sb-fast', (s.fastest || []).map((e) => [e.names, e.time.toFixed(1) + 's']));
   fillList('sb-most', (s.most || []).map((e) => [e.names, `${e.count} \u00b7 ${e.time.toFixed(1)}s`]));
 }
+// ---- levels ----
+function progOf(p) {
+  if (lvAxis === 'y') return Math.max(0, Math.min(1, p.y / finishX));
+  return Math.max(0, Math.min(1, (p.x + size / 2 - startX) / (finishX - startX)));
+}
+function applyLevel() {
+  const L = levels.find((l) => l.id === myLv);
+  if (!L) return;
+  lvAxis = L.axis; lvOx = L.ox; startX = L.start; finishX = L.finish;
+  camInit = false;
+  showScores();
+}
+let levelSig = '';
+function updateLevelBar() {
+  const counts = {};
+  for (const info of roster.values()) counts[info.lv] = (counts[info.lv] || 0) + 1;
+  const sig = myLv + '|' + levels.map((l) => l.id + ':' + (counts[l.id] || 0)).join(',');
+  if (sig === levelSig) return;
+  levelSig = sig;
+  levelBar.textContent = '';
+  for (const l of levels) {
+    const b = document.createElement('button');
+    b.dataset.lv = l.id;
+    if (l.id === myLv) b.className = 'on';
+    b.textContent = `Level ${l.id}: ${l.name} (${counts[l.id] || 0} here)`;
+    const d = document.createElement('small'); d.textContent = l.desc; b.appendChild(d);
+    levelBar.appendChild(b);
+  }
+}
+levelBar.addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const lv = Number(b.dataset.lv);
+  try { localStorage.setItem('lanblocks_level', String(lv)); } catch (err) {}
+  if (lv !== myLv && ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'level', lv }));
+  b.blur();
+});
+
 let hostSig = '';
 function updateHostPanel() {
   if (!isHost) return;
@@ -204,7 +256,7 @@ chatIn.addEventListener('keydown', (e) => {
 // ================= rebuilding the world from the compact messages =================
 function applyState() {
   const now = performance.now();
-  players = lastP.map((a) => {
+  players = lastP.filter((a) => a[0] === myId || ((roster.get(a[0]) || {}).lv || 1) === myLv).map((a) => {
     const info = roster.get(a[0]) || { name: 'P' + a[0], color: '#999999' };
     const tm = timers.get(a[0]);
     return { id: a[0], name: info.name, color: info.color, x: a[1], y: a[2], z: a[3],
@@ -230,15 +282,14 @@ function applyState() {
                  len: Math.hypot(cum[cum.length - 1], pts[pts.length - 1][1] - pts[0][1]), rope: pts });
   }
 
-  const track = finishX - startX;
-  groups = groupTopo.map((g) => {
+  groups = groupTopo.filter((g) => g.members.every((id) => (roster.get(id) || {}).lv === myLv)).map((g) => {
     const ms = g.members.map((id) => byId.get(id)).filter(Boolean);
     const tm = timers.get(g.members[0]);
     return { id: g.members[0], members: ms.map((p) => p.id), names: g.names,
-             progs: ms.map((p) => Math.max(0, Math.min(1, (p.x + h2 - startX) / track))),
+             progs: ms.map(progOf),
              fin: ms.some((p) => p.fin), fin_time: tm ? tm.run : 0 };
   });
-  statusBase = `Connected - ${players.length} player(s)` + (isHost ? ' - you are the host' : '') + (hostNote ? ' - ' + hostNote : '');
+  statusBase = `Connected - ${roster.size} player(s) online, ${players.length} in this level` + (isHost ? ' - you are the host' : '') + (hostNote ? ' - ' + hostNote : '');
   updateHostPanel();
 }
 
@@ -271,16 +322,22 @@ function connect() {
     const msg = JSON.parse(e.data);
     if (msg.type === 'welcome') {
       myId = msg.id; size = msg.size; rest = msg.tether_rest; grabRange = msg.grab_range; linkRange = msg.link_range;
-      startX = msg.start_x; finishX = msg.finish_x; halfW = msg.half_w;
+      halfW = msg.half_w; levels = msg.levels || []; myLv = msg.lv || 1; levelSig = '';
+      for (const sc of msg.scores || []) scoreData[sc.lv] = sc;
+      applyLevel(); updateLevelBar();
+      try { const want = Number(localStorage.getItem('lanblocks_level')); if (want && want !== myLv && levels.some((l) => l.id === want)) ws.send(JSON.stringify({ type: 'level', lv: want })); } catch (err) {}
       boxes = msg.boxes; isHost = !!msg.host; hostSig = '';
       hostPanel.style.display = isHost ? 'block' : 'none';
       lastEventSeq = null;
-      buildSpikes(); showScores(msg.scores || {});
+      buildSpikes();
       hostNote = { wrong: "host key not accepted - it must match the server's HOST_KEY exactly",
                    server_no_key: 'server has no HOST_KEY set - add an environment variable named exactly HOST_KEY, then redeploy' }[msg.host_status] || '';
       if (hostNote) { bannerText = 'Host key not accepted - see the status line below the game'; bannerKind = 'bad'; bannerUntil = performance.now() + 15000; }
     } else if (msg.type === 'topo') {            // rarely: who is here, rope shapes, who is roped to whom
-      roster = new Map(msg.players.map((q) => [q[0], { name: q[1], color: q[2] }]));
+      roster = new Map(msg.players.map((q) => [q[0], { name: q[1], color: q[2], lv: q[3] || 1 }]));
+      const mine = roster.get(myId);
+      if (mine && mine.lv !== myLv) { myLv = mine.lv; applyLevel(); }
+      updateLevelBar();
       ropeTopo = msg.ropes.map((r) => ({ id: r[0], a: r[1], b: r[2], rest: r[3], piv: r[4] || pivOf.get(r[0]) || [] }));
       pivOf = new Map(ropeTopo.map((r) => [r.id, r.piv]));
       groupTopo = msg.groups.map((g) => ({ members: g[0], names: g[1] }));
@@ -611,20 +668,23 @@ function drawLevel() {
 let camInit = false;
 const camPos = [0, 0, 0];
 let VP = new Float32Array(16);
+const camLook = [0, 0, 0];
 function updateCamera(dt) {
   const me = render.get(myId);
   if (!me) return;
   const tx = me.x + size / 2, ty = me.y + size / 2, tz = me.z + size / 2;
-  const a = camInit ? 1 - Math.pow(0.0005, dt) : 1;    // smooth follow, frame-rate independent
+  const a = camInit ? 1 - Math.exp(-dt / 0.12) : 1;    // smooth follow, frame-rate independent
   camPos[0] += (tx - camPos[0]) * a; camPos[1] += (ty - camPos[1]) * a; camPos[2] += (tz - camPos[2]) * a;
   camInit = true;
   const dist = 430;
-  const look = [me.vx * 0.2, 0, me.vz * 0.2];
+  camLook[0] += ((me.svx || 0) * 0.2 - camLook[0]) * (1 - Math.exp(-dt / 0.35));
+  camLook[2] += ((me.svz || 0) * 0.2 - camLook[2]) * (1 - Math.exp(-dt / 0.35));
+  const look = [camLook[0], 0, camLook[2]];
   const cx = camPos[0] + look[0], cy = camPos[1] + 30, cz = camPos[2] + look[2];
   let ex = cx - Math.cos(yaw) * Math.cos(pitch) * dist;
   let ey = cy + Math.sin(pitch) * dist;
   let ez = cz - Math.sin(yaw) * Math.cos(pitch) * dist;
-  ex = Math.max(-20, ex); ez = Math.max(-halfW + 25, Math.min(halfW - 25, ez)); ey = Math.max(60, ey);
+  ex = Math.max(lvOx + 25, ex); ez = Math.max(-halfW + 25, Math.min(halfW - 25, ez)); ey = Math.max(60, ey);
   const view = lookAt([ex, ey, ez], [cx, cy, cz], [0, 1, 0]);
   VP = mul(perspective(1.1, W / H, 20, 8000), view);
   gl.uniform3f(U.uEye, ex, ey, ez);
@@ -645,10 +705,16 @@ function updateRender(dt) {
     let r = render.get(p.id);
     if (!r) { r = { x: p.x, y: p.y, z: p.z, ang: 0 }; render.set(p.id, r); }
     // updates arrive ~20x a second, so carry on along each player's velocity until the next one lands
-    const ex = Math.min(0.15, (performance.now() - stateAt) / 1000);
+    const ex = Math.min(0.25, (performance.now() - stateAt) / 1000);
     const mv = p.carried_by == null && !p.docked ? ex : 0;
     const tx = p.x + p.vx * mv, ty = p.y + p.vy * mv, tz = p.z + p.vz * mv;
-    const k = 1 - Math.pow(1e-20, dt);             // quick but smooth (~0.55 per frame at 60fps)
+    // feed-forward: keep gliding at the (smoothed) velocity, and ease only the leftover error away
+    r.svx = (r.svx ?? p.vx) + (p.vx - (r.svx ?? p.vx)) * (1 - Math.exp(-dt / 0.06));
+    r.svy = (r.svy ?? p.vy) + (p.vy - (r.svy ?? p.vy)) * (1 - Math.exp(-dt / 0.06));
+    r.svz = (r.svz ?? p.vz) + (p.vz - (r.svz ?? p.vz)) * (1 - Math.exp(-dt / 0.06));
+    const k = 1 - Math.exp(-dt / 0.09);
+    const gl = p.carried_by == null && !p.docked ? 1 : 0;
+    r.x += r.svx * dt * gl; r.y += r.svy * dt * gl; r.z += r.svz * dt * gl;
     r.x += (tx - r.x) * k; r.y += (ty - r.y) * k; r.z += (tz - r.z) * k;
     if (Math.abs(tx - r.x) > 300 || Math.abs(tz - r.z) > 300 || Math.abs(ty - r.y) > 300) {
       r.x = tx; r.y = ty; r.z = tz;                // teleport (reset to start)
@@ -854,11 +920,11 @@ function drawHUD() {
 // progress bars: each team's slowest partner is what counts, since both must finish
 function drawProgress(me) {
   const bw = Math.min(720, W - 60), x0 = (W - bw) / 2;
-  const trackLen = finishX - startX;
+  const trackLen = lvAxis === 'y' ? finishX : finishX - startX;
   const rows = groups.map((g) => ({ id: g.id, own: !!me && g.id === me.team, col: teamColor(g.id), names: g.names,
                                     progs: g.progs, members: g.members }));
   if (me && me.team == null) {
-    const pr = Math.max(0, Math.min(1, (me.x + size / 2 - startX) / trackLen));
+    const pr = progOf(me);
     rows.push({ id: 0, own: true, col: me.color, names: `${me.name} (no tether)`, progs: [pr], members: [me.id] });
   }
   const worst = (r) => Math.min(...r.progs);
