@@ -39,6 +39,47 @@
   #levels button small { display: block; color: #99a; font-size: 11.5px; }
   #levels button.on { background: #4a6fd8; border-color: #7f9cf0; color: #fff; }
   #levels button.on small { color: #dde; }
+  #tabs { width: 100%; max-width: 1440px; margin-top: 10px; }
+  #tabbar { display: flex; gap: 4px; border-bottom: 1px solid #3a3a4c; }
+  #tabbar button { padding: 8px 16px; border: 1px solid transparent; border-bottom: 0; border-radius: 8px 8px 0 0;
+                   background: none; color: #99a; cursor: pointer; font-size: 14px; margin-bottom: -1px; }
+  #tabbar button:hover { color: #dde; }
+  #tabbar button.on { background: #1d1d28; border-color: #3a3a4c; color: #fff; }
+  #tabbar .count { font-size: 11.5px; color: #889; margin-left: 4px; }
+  .tabpane { display: none; background: #1d1d28; border: 1px solid #3a3a4c; border-top: 0; border-radius: 0 0 8px 8px;
+             padding: 12px; }
+  .tabpane.on { display: block; }
+  #levels { margin-top: 0; justify-content: flex-start; }
+  #bigchatlog { height: 260px; overflow-y: auto; font-size: 14px; line-height: 1.45; word-break: break-word; }
+  #bigchatlog div { padding: 1px 0; }
+  #bigchatlog .sys { color: #889; font-style: italic; }
+  #bigchatin, .noteform textarea { width: 100%; box-sizing: border-box; margin-top: 8px; padding: 8px 10px;
+             border-radius: 6px; border: 1px solid #555; background: #2a2a38; color: #fff; font: inherit; font-size: 14px; }
+  .noteform { display: flex; gap: 8px; align-items: flex-end; margin-bottom: 10px; }
+  .noteform textarea { margin: 0; resize: vertical; min-height: 44px; }
+  .noteform button { padding: 9px 16px; border: 0; border-radius: 6px; background: #4a6fd8; color: #fff; cursor: pointer; flex: none; }
+  .notesort { font-size: 12.5px; color: #99a; margin-bottom: 6px; }
+  .notesort button { background: none; border: 0; color: #99a; cursor: pointer; padding: 2px 6px; font-size: 12.5px; }
+  .notesort button.on { color: #fff; text-decoration: underline; }
+  .notelist { max-height: 420px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .note { display: flex; gap: 10px; align-items: flex-start; background: #24242f; border: 1px solid #343444;
+          border-radius: 6px; padding: 8px 10px; }
+  .note.soon { border-color: #3f8f5a; }
+  .note .body { flex: 1; min-width: 0; }
+  .note .text { white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.4; }
+  .note .meta { font-size: 12px; color: #889; margin-top: 3px; }
+  .note .badge { display: inline-block; background: #2e7d4f; color: #fff; font-size: 11px; font-weight: 600;
+                 padding: 1px 7px; border-radius: 10px; margin-right: 6px; letter-spacing: .03em; }
+  .votes { display: flex; gap: 4px; flex: none; }
+  .votes button { min-width: 50px; padding: 4px 8px; border-radius: 6px; border: 1px solid #444; background: #2a2a38;
+                  color: #ccd; cursor: pointer; font-size: 13px; }
+  .votes button.mine.up { background: #2e7d4f; border-color: #3fa86a; color: #fff; }
+  .votes button.mine.down { background: #9b3a30; border-color: #c0392b; color: #fff; }
+  .hostacts { display: flex; gap: 4px; flex: none; }
+  .hostacts button { padding: 4px 8px; border-radius: 6px; border: 0; cursor: pointer; font-size: 12px; color: #fff; }
+  .hostacts .soonbtn { background: #2e7d4f; }
+  .hostacts .rmbtn { background: #c0392b; }
+  .empty { color: #778; font-size: 13.5px; padding: 6px 0; }
   #status { margin: 6px 0; font-size: 13px; color: #aab; }
   p.help { max-width: 1100px; text-align: center; font-size: 13.5px; line-height: 1.6; margin: 8px 0 0; }
   kbd { background: #333; border: 1px solid #555; border-radius: 4px; padding: 0 5px; font-size: 12px; }
@@ -71,7 +112,29 @@
     </div>
   </div>
 </div>
-<div id="levels"></div>
+<div id="tabs">
+  <div id="tabbar">
+    <button data-tab="levels">Levels</button>
+    <button data-tab="chat">Chat</button>
+    <button data-tab="bug">Bug reports<span class="count" id="count-bug"></span></button>
+    <button data-tab="idea">Suggestions<span class="count" id="count-idea"></span></button>
+  </div>
+  <div class="tabpane" id="pane-levels"><div id="levels"></div></div>
+  <div class="tabpane" id="pane-chat">
+    <div id="bigchatlog"></div>
+    <input id="bigchatin" maxlength="120" placeholder="Type a message and press Enter" autocomplete="off">
+  </div>
+  <div class="tabpane" id="pane-bug">
+    <div class="noteform"><textarea maxlength="300" placeholder="What went wrong? Where were you and what were you doing?"></textarea><button>Post bug</button></div>
+    <div class="notesort">Sort: <button data-sort="top" class="on">Top voted</button><button data-sort="new">Newest</button></div>
+    <div class="notelist"></div>
+  </div>
+  <div class="tabpane" id="pane-idea">
+    <div class="noteform"><textarea maxlength="300" placeholder="Got an idea for the game? A level, a mechanic, a change..."></textarea><button>Post suggestion</button></div>
+    <div class="notesort">Sort: <button data-sort="top" class="on">Top voted</button><button data-sort="new">Newest</button></div>
+    <div class="notelist"></div>
+  </div>
+</div>
 <div id="nogl">Your browser couldn't start WebGL, which this game needs. Try a recent Chrome, Safari or Firefox.</div>
 <div id="status">Connecting...</div>
 <p class="help">
@@ -85,7 +148,7 @@
   Tether up with as many friends as you like (<kbd>Q</kbd> toggles a rope to the nearest player). Everyone roped together must reach the finish, and the more of you there are, the shorter the ropes get. A spike or the void sends the whole group back to the start.
   Big gap? Dock, have your partner run away to stretch the rope, then let go - they fly back at you.
   Hold <kbd>E</kbd> to grab them as they pass, jump together, and the rider can hit <kbd>Space</kbd> mid-air for a second hop.<br>
-  <b>Levels:</b> pick one with the buttons under the game - each has its own scoreboards. In Sky Tower, carry a friend (<kbd>E</kbd>), jump, and they hop off your head onto the ledge; then they stand at the edge holding <kbd>E</kbd> and catch you as you jump.
+  <b>Levels:</b> pick one in the Levels tab under the game - each has its own scoreboards. The other tabs have a bigger chat, plus bug reports and suggestions you can post and vote on. In Sky Tower, carry a friend (<kbd>E</kbd>), jump, and they hop off your head onto the ledge; then they stand at the edge holding <kbd>E</kbd> and catch you as you jump.
 </p>
 
 <script>
@@ -96,6 +159,7 @@ const wrap = document.getElementById('wrap');
 const statusEl = document.getElementById('status');
 const nameInput = document.getElementById('name');
 const chatIn = document.getElementById('chatin');
+const bigChatLog = document.getElementById('bigchatlog'), bigChatIn = document.getElementById('bigchatin');
 const chatLog = document.getElementById('chatlog');
 const hostPanel = document.getElementById('hostpanel');
 const hostList = document.getElementById('hostlist');
@@ -153,10 +217,13 @@ function addChat(msg) {
     n.textContent = msg.name + ': '; n.style.color = msg.color || '#ccc';
     row.appendChild(n); row.appendChild(document.createTextNode(msg.text));
   }
-  const atBottom = chatLog.scrollTop + chatLog.clientHeight >= chatLog.scrollHeight - 30;
-  chatLog.appendChild(row);
-  while (chatLog.children.length > 80) chatLog.removeChild(chatLog.firstChild);
-  if (atBottom) chatLog.scrollTop = chatLog.scrollHeight;
+  for (const [log, keep] of [[chatLog, 80], [bigChatLog, 300]]) {
+    const r = log === chatLog ? row : row.cloneNode(true);
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    log.appendChild(r);
+    while (log.children.length > keep) log.removeChild(log.firstChild);
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
   if (!msg.sys && msg.id) {
     bubbles.set(msg.id, { text: msg.text, until: performance.now() + Math.min(9000, 4000 + msg.text.length * 60) });
   }
@@ -243,6 +310,129 @@ hostList.addEventListener('click', (e) => {
 
 function releaseKeys() { keys.clear(); sendInput(true); }
 chatIn.addEventListener('focus', releaseKeys);
+bigChatIn.addEventListener('focus', releaseKeys);
+bigChatIn.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    const text = bigChatIn.value.trim();
+    if (text && ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'chat', text }));
+    bigChatIn.value = '';
+  } else if (e.key === 'Escape') { bigChatIn.value = ''; bigChatIn.blur(); }
+});
+
+// ================= bottom tabs: levels / chat / bug reports / suggestions =================
+const tabBar = document.getElementById('tabbar');
+function showTab(name) {
+  for (const b of tabBar.children) b.classList.toggle('on', b.dataset.tab === name);
+  for (const p of document.querySelectorAll('.tabpane')) p.classList.toggle('on', p.id === 'pane-' + name);
+  try { localStorage.setItem('lanblocks_tab', name); } catch (err) {}
+  if (name === 'chat') bigChatLog.scrollTop = bigChatLog.scrollHeight;
+}
+tabBar.addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { showTab(b.dataset.tab); b.blur(); } });
+let startTab = 'levels';
+try { startTab = localStorage.getItem('lanblocks_tab') || 'levels'; } catch (err) {}
+showTab(document.getElementById('pane-' + startTab) ? startTab : 'levels');
+
+// votes are tied to this browser with a random id it keeps (no accounts)
+let voterId = '';
+try { voterId = localStorage.getItem('lanblocks_voter') || ''; } catch (err) {}
+if (voterId.length < 8) {
+  voterId = Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => b.toString(16).padStart(2, '0')).join('');
+  try { localStorage.setItem('lanblocks_voter', voterId); } catch (err) {}
+}
+let myVotes = {};
+try { myVotes = JSON.parse(localStorage.getItem('lanblocks_votes') || '{}') || {}; } catch (err) {}
+let notesData = [];
+const noteSort = { bug: 'top', idea: 'top' };
+function ago(t) {
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+function renderNotes() {
+  for (const kind of ['bug', 'idea']) {
+    const pane = document.getElementById('pane-' + kind), list = pane.querySelector('.notelist');
+    let ns = notesData.filter((n) => n.kind === kind);
+    document.getElementById('count-' + kind).textContent = ns.length ? ns.length : '';
+    if (noteSort[kind] === 'new') ns.sort((a, b) => b.t - a.t);
+    else ns.sort((a, b) => (b.soon - a.soon) || ((b.up - b.down) - (a.up - a.down)) || (b.t - a.t));
+    const keep = list.scrollTop;
+    list.textContent = '';
+    if (!ns.length) {
+      const d = document.createElement('div'); d.className = 'empty';
+      d.textContent = kind === 'bug' ? 'No bug reports yet.' : 'No suggestions yet.';
+      list.appendChild(d);
+    }
+    for (const n of ns) {
+      const row = document.createElement('div'); row.className = 'note' + (n.soon ? ' soon' : '');
+      const mine = myVotes[n.id] || 0;
+      const votes = document.createElement('div'); votes.className = 'votes';
+      for (const [v, label, cnt] of [[1, '\u{1F44D}', n.up], [-1, '\u{1F44E}', n.down]]) {
+        const b = document.createElement('button');
+        b.className = (v > 0 ? 'up' : 'down') + (mine === v ? ' mine' : '');
+        b.textContent = label + ' ' + cnt; b.dataset.vote = v; b.dataset.id = n.id;
+        b.title = v > 0 ? 'Thumbs up' : 'Thumbs down';
+        votes.appendChild(b);
+      }
+      const body = document.createElement('div'); body.className = 'body';
+      const text = document.createElement('div'); text.className = 'text';
+      if (n.soon) { const bd = document.createElement('span'); bd.className = 'badge'; bd.textContent = 'COMING SOON'; text.appendChild(bd); }
+      text.appendChild(document.createTextNode(n.text));
+      const meta = document.createElement('div'); meta.className = 'meta';
+      const who = document.createElement('b'); who.textContent = n.by; who.style.color = n.color;
+      meta.appendChild(who); meta.appendChild(document.createTextNode(' \u00b7 ' + ago(n.t)));
+      body.appendChild(text); body.appendChild(meta);
+      row.appendChild(votes); row.appendChild(body);
+      if (isHost) {
+        const ha = document.createElement('div'); ha.className = 'hostacts';
+        const s = document.createElement('button'); s.className = 'soonbtn'; s.dataset.act = 'soon'; s.dataset.id = n.id;
+        s.textContent = n.soon ? 'Unmark' : 'Coming soon';
+        const r = document.createElement('button'); r.className = 'rmbtn'; r.dataset.act = 'remove'; r.dataset.id = n.id;
+        r.textContent = 'Remove';
+        ha.appendChild(s); ha.appendChild(r); row.appendChild(ha);
+      }
+      list.appendChild(row);
+    }
+    list.scrollTop = keep;
+  }
+}
+for (const kind of ['bug', 'idea']) {
+  const pane = document.getElementById('pane-' + kind);
+  const ta = pane.querySelector('textarea'), post = pane.querySelector('.noteform button');
+  const send = () => {
+    const text = ta.value.trim();
+    if (!text || !ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: 'note_add', kind, text }));
+    ta.value = '';
+  };
+  post.addEventListener('click', send);
+  ta.addEventListener('focus', releaseKeys);
+  ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+  pane.querySelector('.notesort').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    noteSort[kind] = b.dataset.sort;
+    for (const x of pane.querySelectorAll('.notesort button')) x.classList.toggle('on', x === b);
+    renderNotes();
+  });
+  pane.querySelector('.notelist').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b || !ws || ws.readyState !== 1) return;
+    const id = Number(b.dataset.id);
+    if (b.dataset.vote) {
+      const v = Number(b.dataset.vote), nv = myVotes[id] === v ? 0 : v;      // click again to take your vote back
+      if (nv) myVotes[id] = nv; else delete myVotes[id];
+      try { localStorage.setItem('lanblocks_votes', JSON.stringify(myVotes)); } catch (err) {}
+      ws.send(JSON.stringify({ type: 'note_vote', id, v: nv, who: voterId }));
+      renderNotes();
+    } else if (b.dataset.act === 'remove') {
+      if (b.dataset.armed) ws.send(JSON.stringify({ type: 'note_host', id, act: 'remove' }));
+      else { b.dataset.armed = '1'; b.textContent = 'Sure?'; setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = 'Remove'; } }, 3000); }
+    } else if (b.dataset.act === 'soon') {
+      ws.send(JSON.stringify({ type: 'note_host', id, act: 'soon' }));
+    }
+  });
+}
+setInterval(() => { if (notesData.length) renderNotes(); }, 60000);   // keep "5m ago" fresh
 nameInput.addEventListener('focus', releaseKeys);
 chatIn.addEventListener('mousedown', (e) => e.stopPropagation());
 chatIn.addEventListener('keydown', (e) => {
@@ -363,6 +553,8 @@ function connect() {
     } else if (msg.type === 'pong') {
       rtt = performance.now() - msg.t; serverMs = msg.load;
       perfText = `  |  ping ${Math.round(rtt)} ms  |  server ${serverMs} ms/tick  |  ${fps} fps`;
+    } else if (msg.type === 'notes') {
+      notesData = msg.notes || []; renderNotes();
     } else if (msg.type === 'chat') {
       addChat(msg);
     } else if (msg.type === 'scores') {
@@ -416,7 +608,7 @@ setInterval(() => {
 }, 500);   // heartbeat so a missed message can't leave you stuck
 
 window.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT') return;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
   if (e.key === 'Enter') { e.preventDefault(); chatIn.focus(); return; }
   const k = e.key.toLowerCase();
   if (['arrowleft', 'arrowright', 'arrowup', 'arrowdown', ' '].includes(k)) e.preventDefault();
@@ -424,7 +616,7 @@ window.addEventListener('keydown', (e) => {
   sendInput(false);
 });
 window.addEventListener('keyup', (e) => {
-  if (e.target.tagName === 'INPUT') return;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
   keys.delete(e.key.toLowerCase());
   sendInput(false);
 });
