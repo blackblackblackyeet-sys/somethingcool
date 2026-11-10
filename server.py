@@ -1416,13 +1416,6 @@ async def handle(reader, writer):
                         finish=v["finish"]) for k, v in LEVELS.items()],
         "tether_rest": TETHER_REST, "grab_range": GRAB_RANGE, "link_range": LINK_RANGE,
         "scores": [scores_msg(lv) for lv in LEVELS],
-        "phys": dict(MOVE_SPEED=MOVE_SPEED, GROUND_ACCEL=GROUND_ACCEL, AIR_ACCEL=AIR_ACCEL,
-                     GROUND_FRICTION=GROUND_FRICTION, AIR_FRICTION=AIR_FRICTION, OVERSPEED_GROUND=OVERSPEED_GROUND,
-                     OVERSPEED_AIR=OVERSPEED_AIR, WALL_BOUNCE=WALL_BOUNCE, BOUNCE_MIN=BOUNCE_MIN, GRAVITY=GRAVITY,
-                     FALL_MULT=FALL_MULT, JUMP_SPEED=JUMP_SPEED, JUMP_CUT=JUMP_CUT, COYOTE=COYOTE,
-                     JUMP_BUFFER=JUMP_BUFFER, MAX_FALL=MAX_FALL, MAX_SPEED=MAX_SPEED, TICK=1 / TICK_RATE,
-                     TETHER_K=TETHER_K, TETHER_DAMP=TETHER_DAMP, TETHER_MAX_ACC=TETHER_MAX_ACC,
-                     LEAN_BOOST=LEAN_BOOST, LEAN_DOT=LEAN_DOT),
     }).encode()))
     writer.write(make_frame(dumps(topo_obj(with_pivots=True)).encode()))
 
