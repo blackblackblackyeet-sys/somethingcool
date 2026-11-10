@@ -554,6 +554,99 @@ def record_finish(ids, secs, lv=1):
     broadcast(scores_msg(lv))
 
 
+# ---------- bug reports & suggestions board ----------
+NOTES_FILE = os.path.join(HERE, "notes.json")
+NOTE_MAX = 300            # characters per note
+NOTE_COOLDOWN = 15.0      # seconds between posts per player
+NOTE_LIMIT = 150          # notes kept per board
+NOTE_KINDS = ("bug", "idea")
+notes = []                # {"id", "kind", "text", "by", "color", "t", "votes": {voter: +1/-1}, "soon": bool}
+note_seq = 0
+notes_dirty = False
+notes_sent_at = 0.0
+
+
+def load_notes():
+    global note_seq
+    try:
+        with open(NOTES_FILE) as f:
+            data = json.load(f)
+        for n in data.get("notes", []):
+            if n.get("kind") in NOTE_KINDS and isinstance(n.get("text"), str):
+                notes.append({"id": int(n["id"]), "kind": n["kind"], "text": n["text"][:NOTE_MAX],
+                              "by": str(n.get("by", "?"))[:20], "color": str(n.get("color", "#ccc"))[:20],
+                              "t": float(n.get("t", 0)), "soon": bool(n.get("soon")),
+                              "votes": {str(k)[:40]: (1 if v > 0 else -1) for k, v in dict(n.get("votes", {})).items()}})
+        note_seq = max([n["id"] for n in notes] + [0])
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+
+
+def save_notes():
+    try:
+        with open(NOTES_FILE, "w") as f:
+            json.dump({"notes": notes}, f)
+    except OSError:
+        pass
+
+
+def notes_msg():
+    return {"type": "notes", "notes": [
+        {"id": n["id"], "kind": n["kind"], "text": n["text"], "by": n["by"], "color": n["color"], "t": n["t"],
+         "soon": n["soon"], "up": sum(1 for v in n["votes"].values() if v > 0),
+         "down": sum(1 for v in n["votes"].values() if v < 0)} for n in notes]}
+
+
+def notes_changed():
+    global notes_dirty
+    notes_dirty = True        # sent out (at most twice a second) by the game loop, and saved
+    save_notes()
+
+
+def handle_note(me, msg):
+    global note_seq
+    kind = msg.get("type")
+    if kind == "note_add":
+        text = "".join(ch for ch in str(msg.get("text", "")) if ch.isprintable() or ch == "\n").strip()[:NOTE_MAX]
+        nk = msg.get("kind")
+        now = time.monotonic()
+        if not text or nk not in NOTE_KINDS:
+            return
+        if now - me.get("last_note", -1e9) < NOTE_COOLDOWN:
+            notice(me["id"], f"Wait {NOTE_COOLDOWN - (now - me['last_note']):.0f}s before posting another")
+            return
+        me["last_note"] = now
+        note_seq += 1
+        notes.append({"id": note_seq, "kind": nk, "text": text, "by": me["name"], "color": me["color"],
+                      "t": time.time(), "votes": {}, "soon": False})
+        same = [n for n in notes if n["kind"] == nk]
+        if len(same) > NOTE_LIMIT:            # board full: drop the oldest that isn't marked coming soon
+            old = next((n for n in same if not n["soon"]), same[0])
+            notes.remove(old)
+        notes_changed()
+    elif kind == "note_vote":
+        n = next((n for n in notes if n["id"] == msg.get("id")), None)
+        who = str(msg.get("who", ""))[:40]
+        v = msg.get("v")
+        if n is None or len(who) < 8 or v not in (-1, 0, 1):
+            return
+        if v == 0:
+            n["votes"].pop(who, None)
+        else:
+            n["votes"][who] = v
+        notes_changed()
+    elif kind == "note_host" and me["host"]:
+        n = next((n for n in notes if n["id"] == msg.get("id")), None)
+        if n is None:
+            return
+        act = msg.get("act")
+        if act == "remove":
+            notes.remove(n)
+        elif act == "soon":
+            n["soon"] = not n["soon"]
+        notes_changed()
+
+
 def link(a, b):
     """Rope two players together. Returns the new rope (None if they already have one)."""
     global next_link
@@ -1230,7 +1323,7 @@ def send_world(now):
 
 
 async def game_loop():
-    global server_load
+    global server_load, notes_dirty, notes_sent_at
     step = 1 / TICK_RATE
     last = next_t = time.monotonic()
     n = 0
@@ -1246,6 +1339,10 @@ async def game_loop():
             if n >= state_every():
                 n = 0
                 send_world(t0)
+            if notes_dirty and t0 - notes_sent_at > 0.5:
+                notes_dirty = False
+                notes_sent_at = t0
+                broadcast(notes_msg())
         except Exception:
             traceback.print_exc()
         server_load = server_load * 0.95 + (time.monotonic() - t0) * 1000 * 0.05
@@ -1415,6 +1512,7 @@ async def handle(reader, writer):
         "scores": [scores_msg(lv) for lv in LEVELS],
     }).encode()))
     writer.write(make_frame(dumps(topo_obj(with_pivots=True)).encode()))
+    writer.write(make_frame(json.dumps(notes_msg()).encode()))
 
     try:
         while True:
@@ -1469,6 +1567,8 @@ async def handle(reader, writer):
                         me["last_chat"] = now
                         broadcast({"type": "chat", "id": pid, "name": me["name"],
                                    "color": me["color"], "text": text})
+                elif kind in ("note_add", "note_vote", "note_host"):
+                    handle_note(me, msg)
                 elif kind == "kick":
                     if me["host"]:
                         try:
@@ -1530,6 +1630,7 @@ def lan_ips():
 
 async def main():
     load_scores()
+    load_notes()
     ips = lan_ips()
     LOCAL_IPS.update(ips)
     server = await asyncio.start_server(handle, "0.0.0.0", PORT)
