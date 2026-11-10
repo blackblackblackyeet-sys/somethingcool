@@ -600,7 +600,6 @@ def set_level(p, lv):
     p["fin"] = False
     p["no_grab"] = False
     reset_solo(p)
-    sys_chat(f"{p['name']} went to {LEVELS[lv]['name']}")
 
 
 def handle_links():
@@ -620,10 +619,8 @@ def handle_links():
         t = find_link(p["id"], q["id"])
         if t is not None:
             unlink(t)
-            sys_chat(f"{p['name']} untethered from {q['name']}")
         else:
             link(p, q)
-            sys_chat(f"{p['name']} tethered to {q['name']}")
 
 
 # ---------- kicking (host only) ----------
@@ -634,6 +631,7 @@ def kick(target_id, by_id):
         return
     kick_block[target["ip"]] = time.monotonic() + KICK_BLOCK_SECONDS
     send_to(target_id, {"type": "kicked", "text": "You were kicked by the host."})
+    target["kicked"] = True
     sys_chat(f"{target['name']} was kicked by the host")
     print(f"Kicked {target['name']} ({target['ip']})")
     w = clients.get(target_id)
@@ -1138,7 +1136,6 @@ def tick(dt):
             finish_events.append({"ids": list(g), "until": now + FINISH_PAUSE})
             record_finish(g, secs, lvn)
             announce(f"{names_of(g)} finished in {secs:.1f}s!", "good", lv=lvn)
-            sys_chat(f"{names_of(g)} finished {LEVELS[lvn]['name']} in {secs:.1f}s!")
     for ev in list(finish_events):
         if now >= ev["until"]:
             finish_events.remove(ev)
@@ -1458,6 +1455,9 @@ async def handle(reader, writer):
                     me["name"] = clean_name(msg.get("name", ""), f"P{pid}")
                     if me["name"] != old:
                         print(f"{old} is now called {me['name']}")
+                    if not me.get("announced"):            # first name from this browser = they've joined
+                        me["announced"] = True
+                        sys_chat(f"{me['name']} joined")
                 elif kind == "ping":
                     t = msg.get("t")
                     if isinstance(t, (int, float)) and not isinstance(t, bool):
@@ -1495,6 +1495,8 @@ async def handle(reader, writer):
         clients.pop(pid, None)
         compute_groups()
         print(f"{name} left ({len(players)} online)")
+        if me.get("announced") and not me.get("kicked"):
+            sys_chat(f"{name} left")
         writer.close()
 
 
