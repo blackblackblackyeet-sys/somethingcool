@@ -303,6 +303,7 @@ function onBinaryState(buf) {
   }
   lastP = rows; stateAt = performance.now();
   applyState();
+  reconcile();
 }
 
 // ================= connection =================
@@ -310,7 +311,7 @@ function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/${location.search}`);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { statusEl.textContent = 'Connected'; sendName(); };
+  ws.onopen = () => { statusEl.textContent = 'Connected'; sendName(); ws.send(JSON.stringify({ type: 'ping', t: performance.now() })); };
   ws.onclose = () => {
     players = []; ropes = []; groups = []; render.clear(); camInit = false; statusBase = ''; lastP = null;
     if (kicked) return;
@@ -327,6 +328,8 @@ function connect() {
       applyLevel(); updateLevelBar();
       try { const want = Number(localStorage.getItem('lanblocks_level')); if (want && want !== myLv && levels.some((l) => l.id === want)) ws.send(JSON.stringify({ type: 'level', lv: want })); } catch (err) {}
       boxes = msg.boxes; isHost = !!msg.host; hostSig = '';
+      if (msg.phys) { PH = msg.phys; SOLIDS = boxes.filter((b) => [0, 1, 2, 4].includes(b[6])); }
+      pred.active = false;
       hostPanel.style.display = isHost ? 'block' : 'none';
       lastEventSeq = null;
       buildSpikes();
@@ -362,6 +365,7 @@ function connect() {
       bannerText = msg.text; bannerKind = msg.kind || 'bad'; bannerUntil = performance.now() + 2800;
     } else if (msg.type === 'pong') {
       rtt = performance.now() - msg.t; serverMs = msg.load;
+      rttSm = rttSm ? rttSm + (rtt - rttSm) * 0.3 : rtt;
       perfText = `  |  ping ${Math.round(rtt)} ms  |  server ${serverMs} ms/tick  |  ${fps} fps`;
     } else if (msg.type === 'chat') {
       addChat(msg);
@@ -409,7 +413,7 @@ function sendInput(force) {
   ws.send(s); lastSent = s; lastSentAt = now;
 }
 setInterval(() => sendInput(true), 1000);
-setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', t: performance.now() })); }, 5000);
+setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', t: performance.now() })); }, 2000);
 setInterval(() => {
   if (!ws || ws.readyState !== 1 || kicked || !statusBase) return;
   statusEl.textContent = statusBase + perfText.replace(/\d+ fps/, fps + ' fps');
@@ -699,7 +703,164 @@ function project(x, y, z) {
 }
 
 // ================= per-player smoothing =================
+// ================= client-side prediction (your own cube moves the instant you press a key) =================
+// Your page runs the same movement physics as the server for YOUR cube only. When the server's answer
+// arrives (one ping later) we compare it with where we predicted we were back then, and quietly nudge
+// toward it. Ropes, throws and resets come from the server and get blended in the same way.
+let PH = null, SOLIDS = [], rttSm = 0, predAcc = 0;
+const pred = { active: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, on: false, coyote: 0, jbuf: 0, jprev: false,
+               rising: false, docked: false, hist: [] };
+function ovl(x, y, z, b, g) {
+  return x - g < b[3] - 0.001 && x + size + g > b[0] + 0.001 && y - g < b[4] - 0.001 && y + size + g > b[1] + 0.001 &&
+         z - g < b[5] - 0.001 && z + size + g > b[2] + 0.001;
+}
+function predStep(dt) {
+  const P = PH, inp = input, q = pred;
+  const edge = inp.jump && !q.jprev; q.jprev = inp.jump;
+  q.jbuf = edge ? P.JUMP_BUFFER : Math.max(0, q.jbuf - dt);
+  q.coyote = q.on ? P.COYOTE : Math.max(0, q.coyote - dt);
+  q.docked = !!(inp.dock && (q.docked || SOLIDS.some((b) => ovl(q.x, q.y, q.z, b, 3))));
+  if (q.docked) { q.vx = q.vy = q.vz = 0; return; }
+  // ropes: pull toward the partner (or the first pole the rope wraps around), like the server does
+  let lean = null, leanBest = -1;
+  const h2 = size / 2, me = [q.x + h2, q.y + h2, q.z + h2];
+  for (const t of ropeTopo) {
+    if (t.a !== myId && t.b !== myId) continue;
+    const oid = t.a === myId ? t.b : t.a, o = render.get(oid), op = players.find((pp) => pp.id === oid);
+    if (!o || !op) continue;
+    if (op.carried_by === myId || op.carrying === myId) continue;
+    const oc = [o.x + h2, o.y + h2, o.z + h2];
+    const piv = t.a === myId ? t.piv : [...t.piv].reverse();      // from my end towards theirs
+    const path = [[me[0], me[2]], ...piv.map((v) => [v[0], v[1]]), [oc[0], oc[2]]];
+    let xz = 0;
+    for (let i = 1; i < path.length; i++) xz += Math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]);
+    const len = Math.hypot(xz, oc[1] - me[1]);
+    if (len <= t.rest || op.docked && q.docked) continue;
+    // the first rope point after me, with its height interpolated along the rope
+    const seg1 = Math.hypot(path[1][0] - path[0][0], path[1][1] - path[0][1]);
+    const ny = me[1] + (oc[1] - me[1]) * (xz ? seg1 / xz : 1);
+    let ux = path[1][0] - me[0], uy = ny - me[1], uz = path[1][1] - me[2];
+    const ud = Math.hypot(ux, uy, uz) || 1; ux /= ud; uy /= ud; uz /= ud;
+    const last = path.length - 2;
+    let bx = path[last][0] - oc[0], bz = path[last][1] - oc[2], by = (piv.length ? oc[1] + (me[1] - oc[1]) * 0.0 : me[1]) - oc[1];
+    const bd = Math.hypot(bx, by, bz) || 1; bx /= bd; by /= bd; bz /= bd;
+    const stretch = len - t.rest;
+    const hh = Math.hypot(ux, uz);
+    if (hh > 0.05 && stretch > leanBest) { leanBest = stretch; lean = [ux / hh, uz / hh]; }
+    const rel = -(q.vx * ux + q.vy * uy + q.vz * uz) - ((o.vx || 0) * bx + (o.vy || 0) * by + (o.vz || 0) * bz);
+    const acc = Math.min(PH.TETHER_MAX_ACC, PH.TETHER_K * stretch + PH.TETHER_DAMP * Math.max(rel, 0));
+    const share = op.docked ? 1 : 0.5;
+    q.vx += ux * acc * share * dt; q.vy += uy * acc * share * dt; q.vz += uz * acc * share * dt;
+  }
+  q.lean = lean;
+  const on = q.on;
+  let vx = q.vx, vy = q.vy, vz = q.vz, mx = inp.mx, mz = inp.mz, m = Math.hypot(mx, mz);
+  if (m > 1) { mx /= m; mz /= m; m = 1; }
+  const fr = (on ? P.GROUND_FRICTION : P.AIR_FRICTION) * dt, over = (on ? P.OVERSPEED_GROUND : P.OVERSPEED_AIR) * dt;
+  if (m > 0.05) {
+    const ux = mx / m, uz = mz / m, target = P.MOVE_SPEED * m;
+    let accel = (on ? P.GROUND_ACCEL : P.AIR_ACCEL) * dt;
+    if (q.lean && ux * q.lean[0] + uz * q.lean[1] < P.LEAN_DOT) accel *= P.LEAN_BOOST;
+    let s = vx * ux + vz * uz;
+    if (s < target) { const add = Math.min(accel, target - s); vx += ux * add; vz += uz * add; s += add; }
+    let lx = vx - s * ux, lz = vz - s * uz;
+    const lm = Math.hypot(lx, lz);
+    if (lm > 0) { const k = Math.max(0, lm - fr * 0.8) / lm; lx *= k; lz *= k; }
+    if (s > P.MOVE_SPEED) s = Math.max(P.MOVE_SPEED, s - over);
+    vx = s * ux + lx; vz = s * uz + lz;
+  } else {
+    const sp = Math.hypot(vx, vz);
+    if (sp > 0) { const k = Math.max(0, sp - fr - (sp > P.MOVE_SPEED ? over : 0)) / sp; vx *= k; vz *= k; }
+  }
+  if ((inp.jump || q.jbuf > 0) && (on || q.coyote > 0)) { vy = P.JUMP_SPEED; q.coyote = 0; q.jbuf = 0; q.rising = true; }
+  else if (q.rising && !inp.jump && vy > 0) { vy = Math.min(vy, P.JUMP_SPEED * P.JUMP_CUT); q.rising = false; }
+  if (vy <= 0) q.rising = false;
+  vy = Math.max(vy - P.GRAVITY * (vy < 0 ? P.FALL_MULT : 1) * dt, -P.MAX_FALL);
+  const hs = Math.hypot(vx, vz);
+  if (hs > P.MAX_SPEED) { vx *= P.MAX_SPEED / hs; vz *= P.MAX_SPEED / hs; }
+  vy = Math.min(vy, P.MAX_SPEED);
+  const steps = Math.max(1, Math.min(10, Math.floor(Math.max(Math.abs(vx), Math.abs(vz), Math.abs(vy)) * dt / 20) + 1));
+  const sdt = dt / steps;
+  let landed = false;
+  for (let i = 0; i < steps; i++) {
+    for (const axis of [0, 2]) {
+      let v = axis === 0 ? vx : vz;
+      const key = axis === 0 ? 'x' : 'z';
+      q[key] += v * sdt;
+      let hit = false;
+      for (const b of SOLIDS) {
+        if (!ovl(q.x, q.y, q.z, b, 0)) continue;
+        const lo = axis === 0 ? b[0] : b[2], hi = axis === 0 ? b[3] : b[5];
+        if (v > 0) q[key] = lo - size; else if (v < 0) q[key] = hi;
+        else q[key] = q[key] + size / 2 < (lo + hi) / 2 ? lo - size : hi;
+        hit = true;
+      }
+      if (hit) { v = Math.abs(v) > P.BOUNCE_MIN ? -v * P.WALL_BOUNCE : 0; if (axis === 0) vx = v; else vz = v; }
+    }
+    q.y += vy * sdt;
+    for (const b of SOLIDS) {
+      if (!ovl(q.x, q.y, q.z, b, 0)) continue;
+      if (vy < 0) { q.y = b[4]; landed = true; } else if (vy > 0) q.y = b[1] - size;
+      vy = 0;
+    }
+  }
+  q.on = landed; q.vx = vx; q.vy = vy; q.vz = vz;
+}
+function predSnap(p) {
+  Object.assign(pred, { px: p.x, py: p.y, pz: p.z, x: p.x, y: p.y, z: p.z, vx: p.vx, vy: p.vy, vz: p.vz, on: false, docked: p.docked, hist: [] });
+}
+function predUsable(p) { return PH && p && p.carried_by == null && !p.fin && !predOff; }
+let predOff = false;     // escape hatch for testing: predOff = true in the console turns it off
+function predFrame(dt) {
+  const p = players.find((q) => q.id === myId);
+  if (!predUsable(p)) { pred.active = false; return; }
+  if (!pred.active) { predSnap(p); pred.active = true; predAcc = 0; }
+  predAcc += dt;
+  const T = PH.TICK, now = performance.now();
+  while (predAcc >= T) {
+    predAcc -= T;
+    pred.px = pred.x; pred.py = pred.y; pred.pz = pred.z;
+    predStep(T);
+    pred.hist.push({ t: now, x: pred.x, y: pred.y, z: pred.z, vx: pred.vx, vy: pred.vy, vz: pred.vz });
+  }
+  while (pred.hist.length > 120) pred.hist.shift();
+  // standing still: the server stops sending updates, so finish closing any tiny gap ourselves
+  if (Math.hypot(pred.vx, pred.vz) < 5 && Math.hypot(p.vx, p.vz) < 5 && pred.on && now - stateAt > 150) {
+    const k = 1 - Math.exp(-dt / 0.15);
+    const cx = (p.x - pred.x) * k, cz = (p.z - pred.z) * k;
+    pred.x += cx; pred.z += cz; pred.px += cx; pred.pz += cz;
+    for (const e of pred.hist) { e.x += cx; e.z += cz; }
+  }
+}
+function reconcile() {
+  const p = players.find((q) => q.id === myId);
+  if (!pred.active || !predUsable(p)) return;
+  const lag = Math.max(40, rttSm || 120) + 25;      // the server's answer reflects what we did about one ping ago
+  const want = performance.now() - lag;
+  let h = null;
+  for (const e of pred.hist) { if (e.t <= want) h = e; else break; }
+  if (!h) h = pred.hist[0];
+  if (!h) return;
+  const ex = p.x - h.x, ey = p.y - h.y, ez = p.z - h.z;
+  if (window.__errs) window.__errs.push(Math.round(Math.hypot(ex, ez)));
+  if (Math.abs(ex) > 220 || Math.abs(ey) > 220 || Math.abs(ez) > 220) {   // way off (reset, teleport): jump there
+    pred.x = p.x + p.vx * lag / 1000; pred.y = p.y; pred.z = p.z + p.vz * lag / 1000;
+    pred.px = pred.x; pred.py = pred.y; pred.pz = pred.z;
+    pred.vx = p.vx; pred.vy = p.vy; pred.vz = p.vz; pred.hist = []; camInit = false;
+    return;
+  }
+  // nudge position and velocity toward the server, and shift the history by the same amount
+  // so the next comparison doesn't count this correction twice
+  const a = 0.25, bv = 0.5;
+  const cx = ex * a, cy = ey * a, cz = ez * a;
+  const dvx = (p.vx - h.vx) * bv, dvy = p.docked || pred.docked ? 0 : (p.vy - h.vy) * bv * (Math.abs(p.vy - h.vy) > 60 ? 1 : 0), dvz = (p.vz - h.vz) * bv;
+  pred.x += cx; pred.y += cy; pred.z += cz; pred.px += cx; pred.py += cy; pred.pz += cz;
+  pred.vx += dvx; pred.vy += dvy; pred.vz += dvz;
+  for (const e of pred.hist) { e.x += cx; e.y += cy; e.z += cz; e.vx += dvx; e.vy += dvy; e.vz += dvz; }
+}
+
 function updateRender(dt) {
+  predFrame(dt);
   const byId = new Map(players.map((p) => [p.id, p]));
   for (const p of players) {
     let r = render.get(p.id);
@@ -716,6 +877,15 @@ function updateRender(dt) {
     const gl = p.carried_by == null && !p.docked ? 1 : 0;
     r.x += r.svx * dt * gl; r.y += r.svy * dt * gl; r.z += r.svz * dt * gl;
     r.x += (tx - r.x) * k; r.y += (ty - r.y) * k; r.z += (tz - r.z) * k;
+    if (p.id === myId && pred.active) {
+      const f = PH ? Math.min(1, predAcc / PH.TICK) : 1;     // blend between the last two physics steps
+      r.x = pred.px + (pred.x - pred.px) * f; r.y = pred.py + (pred.y - pred.py) * f; r.z = pred.pz + (pred.z - pred.pz) * f; r.svx = pred.vx; r.svz = pred.vz;
+      r.vx = pred.vx; r.vy = pred.vy; r.vz = pred.vz; r.carried_by = null; r.docked = pred.docked;
+      if (Math.hypot(pred.vx, pred.vz) > 60) {
+        let d = Math.atan2(pred.vx, pred.vz) - r.ang; d = Math.atan2(Math.sin(d), Math.cos(d)); r.ang += d * Math.min(1, dt * 8);
+      }
+      continue;
+    }
     if (Math.abs(tx - r.x) > 300 || Math.abs(tz - r.z) > 300 || Math.abs(ty - r.y) > 300) {
       r.x = tx; r.y = ty; r.z = tz;                // teleport (reset to start)
       if (p.id === myId) camInit = false;
